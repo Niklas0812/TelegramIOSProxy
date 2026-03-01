@@ -25,7 +25,7 @@ def patch_incoming_translation(filepath: str) -> None:
 
     override_code = """presentationInterfaceState = presentationInterfaceState.updatedTranslationState(contentData.state.translationState)
 
-            // AI Translation: enable translation rendering + trigger streaming catch-up
+            // AI Translation: enable translation rendering
             if AITranslationSettings.enabled && AITranslationSettings.autoTranslateIncoming {
                 let existingState = presentationInterfaceState.translationState
                 if existingState == nil || existingState?.isEnabled != true {
@@ -40,10 +40,10 @@ def patch_incoming_translation(filepath: str) -> None:
                             )
                         }
                     }
-                    // Streaming catch-up: translate missing messages individually, newest first
-                    if case let .peer(chatPeerId) = self.chatLocation {
-                        AIBackgroundTranslationObserver.translateMessages(peerId: chatPeerId, context: self.context)
-                    }
+                }
+                // Streaming catch-up: fires on EVERY chat open (deduped by catchUpInProgress set)
+                if case let .peer(chatPeerId) = self.chatLocation {
+                    AIBackgroundTranslationObserver.translateMessages(peerId: chatPeerId, context: self.context)
                 }
             }"""
 

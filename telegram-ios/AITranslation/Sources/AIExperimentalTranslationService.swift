@@ -14,10 +14,14 @@ public final class AIExperimentalTranslationService: ExperimentalInternalTransla
         fromLang: String,
         toLang: String
     ) -> Signal<[AnyHashable: String]?, NoError> {
-        // No-op: return empty success to prevent Telegram's batch pipeline from
-        // actually translating. Our streaming catch-up handles all translations.
-        // Returning [:] (not nil) prevents Telegram from falling back to cloud translation.
-        return .single([:])
+        // Return a never-completing signal. This keeps Telegram's pipeline "pending"
+        // forever — it never emits a value, so _internal_translateMessagesByPeerId
+        // never stores TranslationMessageAttribute. Our catch-up handles all translations.
+        // Returning .single([:]) was WRONG — Telegram fell through to store the original
+        // text as "translation", poisoning every message with German-as-English attributes.
+        return Signal { _ in
+            return ActionDisposable(action: {})
+        }
     }
 }
 

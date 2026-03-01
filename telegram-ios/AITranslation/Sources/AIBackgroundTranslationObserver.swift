@@ -410,9 +410,12 @@ public final class AIBackgroundTranslationObserver {
                 // Translate ALL messages (both incoming and own) after URL was configured
                 if message.timestamp >= minTs,
                    !message.text.isEmpty,
-                   !message.attributes.contains(where: { $0 is TranslationMessageAttribute }),
                    !Self.inFlightMessageIds.contains(message.id) {
-                    toTranslate.append((message.id, message.text, message.timestamp))
+                    let existingAttr = message.attributes.first(where: { $0 is TranslationMessageAttribute }) as? TranslationMessageAttribute
+                    // Translate if: no attribute, OR attribute text matches original (poisoned by empty pipeline)
+                    if existingAttr == nil || existingAttr?.text == message.text {
+                        toTranslate.append((message.id, message.text, message.timestamp))
+                    }
                 }
                 return true
             }
@@ -490,9 +493,9 @@ public final class AIBackgroundTranslationObserver {
     private static func storeTranslation(transaction: Transaction, msgId: MessageId, translatedText: String) {
         transaction.updateMessage(msgId, update: { currentMessage in
             var attributes = currentMessage.attributes
-            guard !attributes.contains(where: { $0 is TranslationMessageAttribute }) else {
-                return .skip
-            }
+            // Remove any existing TranslationMessageAttribute (may be poisoned by empty pipeline
+            // which stored original text as "translation") — always overwrite with real translation
+            attributes.removeAll(where: { $0 is TranslationMessageAttribute })
             attributes.append(TranslationMessageAttribute(text: translatedText, entities: [], toLang: "en"))
 
             var storeForwardInfo: StoreMessageForwardInfo?
