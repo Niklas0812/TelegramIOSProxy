@@ -9,8 +9,11 @@ The main user text input path goes through:
 This bypasses ChatController.sendMessages() entirely, so our existing hook
 in patch_chat_controller.py doesn't catch regular typed messages.
 
-This patch intercepts the enqueueMessages() call in the closure to translate
-text messages before they are enqueued.
+This patch intercepts the enqueueMessages() call in the closure to route text
+messages through AIOutgoingMessageQueue — a per-peer chronological queue that:
+  1. Fires translation INSTANTLY (concurrent, no delay)
+  2. Sends to Telegram in strict chronological order
+  3. Cascade-cancels all subsequent messages on any failure
 """
 import sys
 import re
@@ -50,36 +53,42 @@ def patch_load_display_node(filepath: str) -> None:
     else:
         indent = "                        "
 
-    new_code = f"""{indent}// AI Translation: strict translate + enqueue — HARD BLOCK on failure.
-{indent}// Text clears immediately for snappy UX; restored on failure.
+    new_code = f"""{indent}// AI Translation: chronological queue with cascading failure.
+{indent}// Translation fires INSTANTLY per message. Sending is strict chronological order.
+{indent}// On failure: cascade-cancel all subsequent, restore failed text, show error.
 {indent}for aiMsg in transformedMessages {{
 {indent}    switch aiMsg {{
 {indent}    case let .message(text, attributes, inlineStickers, mediaReference, threadId, replyToMessageId, replyToStoryId, localGroupingKey, correlationId, bubbleUpEmojiOrStickersets):
 {indent}        if !text.isEmpty && AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing {{
-{indent}            let originalText = text
-{indent}            let _ = (AITranslationService.shared.translateOutgoingStrict(text: text, chatId: peerId, context: strongSelf.context)
-{indent}            |> deliverOnMainQueue).start(next: {{ [weak strongSelf] translatedText in
-{indent}                guard let strongSelf = strongSelf else {{ return }}
-{indent}                if let translatedText = translatedText, !translatedText.isEmpty {{
-{indent}                    // SUCCESS: enqueue translated message
+{indent}            AIOutgoingMessageQueue.shared.enqueue(
+{indent}                text: text,
+{indent}                peerId: peerId,
+{indent}                context: strongSelf.context,
+{indent}                sendAction: {{ [weak strongSelf] translatedText -> Bool in
+{indent}                    guard let strongSelf = strongSelf else {{ return false }}
 {indent}                    var newAttributes = attributes
-{indent}                    newAttributes.append(TranslationMessageAttribute(text: originalText, entities: [], toLang: "en"))
+{indent}                    newAttributes.append(TranslationMessageAttribute(text: text, entities: [], toLang: "en"))
 {indent}                    let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: [.message(text: translatedText, attributes: newAttributes, inlineStickers: inlineStickers, mediaReference: mediaReference, threadId: threadId, replyToMessageId: replyToMessageId, replyToStoryId: replyToStoryId, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: bubbleUpEmojiOrStickersets)]).start()
-{indent}                }} else {{
-{indent}                    // FAILURE: restore text to input box + show error toast
+{indent}                    return true
+{indent}                }},
+{indent}                restoreAction: {{ [weak strongSelf] originalText in
+{indent}                    guard let strongSelf = strongSelf else {{ return }}
 {indent}                    if let textInputPanelNode = strongSelf.chatDisplayNode.inputPanelNode as? ChatTextInputPanelNode {{
 {indent}                        if textInputPanelNode.text.isEmpty {{
 {indent}                            textInputPanelNode.text = originalText
 {indent}                        }}
 {indent}                    }}
+{indent}                }},
+{indent}                errorAction: {{ [weak strongSelf] in
+{indent}                    guard let strongSelf = strongSelf else {{ return }}
 {indent}                    strongSelf.present(UndoOverlayController(
 {indent}                        presentationData: strongSelf.presentationData,
-{indent}                        content: .info(title: nil, text: "Translation failed! Try again.", timeout: 3.0, customUndoText: nil),
+{indent}                        content: .info(title: nil, text: "Translation failed. Message not sent. Try again.", timeout: 5.0, customUndoText: nil),
 {indent}                        elevatedLayout: true,
 {indent}                        action: {{ _ in return false }}
 {indent}                    ), in: .current)
 {indent}                }}
-{indent}            }})
+{indent}            )
 {indent}        }} else {{
 {indent}            let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: [aiMsg]).start()
 {indent}        }}

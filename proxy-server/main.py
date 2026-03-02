@@ -7,7 +7,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 # --- Configuration ---
@@ -26,7 +26,7 @@ OPENROUTER_MODEL = config["openrouter_model"]
 REQUEST_TIMEOUT = config.get("request_timeout_seconds", 15)
 LOG_FILE = config.get("log_file", "server.log")
 HOST = config.get("host", "0.0.0.0")
-PORT = config.get("port", 8080)
+PORT = config.get("port", 8081)
 
 # --- Logging ---
 
@@ -293,17 +293,22 @@ class TranslationService:
         last_exception = None
 
         # Attempt 1: initial try
-        # Attempts 2-6: retries with appropriate strategy per error type
-        max_total_attempts = 4  # 1 initial + 3 retries (worst case: empty response)
+        # Attempts 2+: retries with appropriate strategy per error type
+        # All error types now get 3 retries for maximum reliability
+        max_total_attempts = 10
 
         empty_delays = [0.5, 1, 2]
         payment_delays = [5, 5, 5]
         timeout_delays = [0, 0, 0]
+        server_delays = [1, 2, 4]
+        general_delays = [1, 2, 4]
 
         empty_retries = 0
         payment_retries = 0
         timeout_retries = 0
         rate_limit_retries = 0
+        server_retries = 0
+        general_retries = 0
 
         for attempt in range(max_total_attempts):
             try:
@@ -316,7 +321,7 @@ class TranslationService:
                 empty_retries += 1
                 self.stats["retries"] += 1
                 logger.warning(
-                    f"Empty response, retry {empty_retries}/5 after {delay}s"
+                    f"Empty response, retry {empty_retries}/3 after {delay}s"
                 )
                 await asyncio.sleep(delay)
             except PaymentError as e:
@@ -353,14 +358,28 @@ class TranslationService:
                 )
             except OpenRouterError as e:
                 last_exception = e
-                logger.error(f"OpenRouter error (no retry): {type(e).__name__}: {e}")
-                break
+                if server_retries >= len(server_delays):
+                    break
+                delay = server_delays[server_retries]
+                server_retries += 1
+                self.stats["retries"] += 1
+                logger.warning(
+                    f"OpenRouter error, retry {server_retries}/3 after {delay}s: "
+                    f"{type(e).__name__}: {e}"
+                )
+                await asyncio.sleep(delay)
             except Exception as e:
                 last_exception = e
-                logger.error(
-                    f"Unexpected error (no retry): {type(e).__name__}: {repr(e)}"
+                if general_retries >= len(general_delays):
+                    break
+                delay = general_delays[general_retries]
+                general_retries += 1
+                self.stats["retries"] += 1
+                logger.warning(
+                    f"Unexpected error, retry {general_retries}/3 after {delay}s: "
+                    f"{type(e).__name__}: {repr(e)}"
                 )
-                break
+                await asyncio.sleep(delay)
 
         raise TranslationExhaustedError(
             f"All retries exhausted. Last error: {last_exception}"
@@ -504,6 +523,11 @@ async def set_prompt_by_direction(direction: str, update: PromptUpdate):
     return {"status": "ok", "direction": direction, "length": len(update.prompt)}
 
 
+@app.get("/")
+async def root():
+    return {"status": "ok"}
+
+
 @app.get("/stats")
 async def stats():
     s = translation_service.stats
@@ -528,12 +552,36 @@ OTA_APP_TITLE = "TranslateGram"
 OTA_BUNDLE_VERSION = "11.13"
 
 
+@app.head("/ota/app.ipa")
+async def ota_ipa_head():
+    ipa_path = OTA_DIR / "app.ipa"
+    if not ipa_path.exists():
+        raise HTTPException(status_code=404, detail="IPA not found")
+    return Response(
+        headers={"Content-Length": str(ipa_path.stat().st_size), "Content-Type": "application/octet-stream"},
+    )
+
+
 @app.get("/ota/app.ipa")
 async def ota_ipa():
     ipa_path = OTA_DIR / "app.ipa"
     if not ipa_path.exists():
         raise HTTPException(status_code=404, detail="IPA not found")
-    return FileResponse(ipa_path, media_type="application/octet-stream", filename="TranslateGram.ipa")
+    file_size = ipa_path.stat().st_size
+
+    def iter_file():
+        with open(ipa_path, "rb") as f:
+            while chunk := f.read(1024 * 1024):  # 1MB chunks
+                yield chunk
+
+    return StreamingResponse(
+        iter_file(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(file_size),
+            "Content-Disposition": "attachment; filename=TranslateGram.ipa",
+        },
+    )
 
 
 @app.get("/ota/manifest.plist")

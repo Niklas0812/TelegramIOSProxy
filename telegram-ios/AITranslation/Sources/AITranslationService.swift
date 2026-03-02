@@ -60,7 +60,12 @@ public final class AITranslationService {
     }
 
     /// Strict outgoing translation — returns nil on ANY failure.
-    /// Used by the outgoing hook to hard-block untranslated messages.
+    /// Used by the outgoing queue to hard-block untranslated messages.
+    ///
+    /// Two-layer retry:
+    /// 1. Backend retries 3x on its side (all error types).
+    /// 2. If backend returns explicit failure flag → nil immediately (no iOS retry).
+    /// 3. If iOS-side error (network/decode/empty) → iOS retries ONCE more.
     public func translateOutgoingStrict(
         text: String,
         chatId: PeerId,
@@ -81,14 +86,41 @@ public final class AITranslationService {
             contextSignal = .single([])
         }
 
+        let chatIdInt = chatId.id._internalGetInt64Value()
+
         return contextSignal
         |> mapToSignal { contextMessages -> Signal<String?, NoError> in
-            return client.translateStrict(
+            return client.translateStrictDetailed(
                 text: text,
                 direction: "outgoing",
-                chatId: chatId.id._internalGetInt64Value(),
+                chatId: chatIdInt,
                 context: contextMessages
             )
+            |> mapToSignal { result -> Signal<String?, NoError> in
+                switch result {
+                case .success(let translatedText):
+                    return .single(translatedText)
+                case .backendFailure:
+                    // Backend already retried 3x and gave up — no iOS retry
+                    return .single(nil)
+                case .iosError:
+                    // iOS-side error (network/decode/empty) — retry once
+                    print("[AITranslation] iOS retry: retrying outgoing translation once")
+                    return client.translateStrictDetailed(
+                        text: text,
+                        direction: "outgoing",
+                        chatId: chatIdInt,
+                        context: contextMessages
+                    )
+                    |> map { retryResult -> String? in
+                        if case .success(let retryText) = retryResult {
+                            return retryText
+                        }
+                        print("[AITranslation] iOS retry: second attempt also failed")
+                        return nil
+                    }
+                }
+            }
         }
     }
 

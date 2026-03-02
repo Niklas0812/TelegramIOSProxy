@@ -111,6 +111,14 @@ public enum AITranslationError: Error {
     case timeout
 }
 
+// MARK: - Strict Translation Result
+
+public enum StrictTranslationResult {
+    case success(String)       // Translated text
+    case backendFailure        // translation_failed=true (backend already retried 3x)
+    case iosError              // Network/decode/empty — iOS should retry once
+}
+
 // MARK: - Proxy Client
 
 public final class AIProxyClient {
@@ -271,6 +279,82 @@ public final class AIProxyClient {
                 } catch {
                     print("[AITranslation] Strict: decode error: \(error)")
                     subscriber.putNext(nil)
+                }
+                subscriber.putCompletion()
+            }
+
+            task.resume()
+
+            return ActionDisposable {
+                task.cancel()
+            }
+        }
+    }
+
+    // MARK: - Translate Strict Detailed (for iOS retry logic)
+
+    /// Same as translateStrict() but returns a detailed result enum so the caller
+    /// can distinguish between backend-explicit-failure (no retry) and iOS-side
+    /// errors (network/decode/empty — should retry once).
+    public func translateStrictDetailed(
+        text: String,
+        direction: String,
+        chatId: Int64,
+        context: [AIContextMessage]
+    ) -> Signal<StrictTranslationResult, NoError> {
+        guard let url = URL(string: "\(baseURL)/translate") else {
+            return .single(.iosError)
+        }
+
+        let request = AITranslateRequest(
+            text: text,
+            direction: direction,
+            chatId: String(chatId),
+            context: context
+        )
+
+        return Signal { subscriber in
+            var urlRequest = URLRequest(url: url)
+            urlRequest.httpMethod = "POST"
+            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+            do {
+                urlRequest.httpBody = try JSONEncoder().encode(request)
+            } catch {
+                subscriber.putNext(.iosError)
+                subscriber.putCompletion()
+                return EmptyDisposable
+            }
+
+            let task = self.session.dataTask(with: urlRequest) { data, response, error in
+                if let error = error {
+                    print("[AITranslation] Detailed: network error: \(error)")
+                    subscriber.putNext(.iosError)
+                    subscriber.putCompletion()
+                    return
+                }
+
+                guard let data = data else {
+                    print("[AITranslation] Detailed: no data received")
+                    subscriber.putNext(.iosError)
+                    subscriber.putCompletion()
+                    return
+                }
+
+                do {
+                    let response = try JSONDecoder().decode(AITranslateResponse.self, from: data)
+                    if response.translationFailed {
+                        print("[AITranslation] Detailed: backend failure for: \(text.prefix(50))...")
+                        subscriber.putNext(.backendFailure)
+                    } else if response.translatedText.isEmpty {
+                        print("[AITranslation] Detailed: empty translated text for: \(text.prefix(50))...")
+                        subscriber.putNext(.iosError)
+                    } else {
+                        subscriber.putNext(.success(response.translatedText))
+                    }
+                } catch {
+                    print("[AITranslation] Detailed: decode error: \(error)")
+                    subscriber.putNext(.iosError)
                 }
                 subscriber.putCompletion()
             }
