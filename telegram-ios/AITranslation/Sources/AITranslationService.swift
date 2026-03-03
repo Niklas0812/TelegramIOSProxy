@@ -188,6 +188,54 @@ public final class AITranslationService {
         )
     }
 
+    /// Strict incoming translation — returns nil on ANY failure.
+    /// Used by the background observer for both real-time and catch-up.
+    ///
+    /// On iOS-side error (network/decode/empty): retries ONCE instantly.
+    /// On backend failure flag: nil immediately (backend already retried 3x).
+    /// Returns nil = don't store anything, message stays in original language.
+    public func translateIncomingStrict(
+        text: String,
+        chatId: PeerId,
+        context: [AIContextMessage]
+    ) -> Signal<String?, NoError> {
+        guard let client = proxyClient else {
+            return .single(nil)
+        }
+        let chatIdInt = chatId.id._internalGetInt64Value()
+        return client.translateStrictDetailed(
+            text: text,
+            direction: "incoming",
+            chatId: chatIdInt,
+            context: context
+        )
+        |> mapToSignal { result -> Signal<String?, NoError> in
+            switch result {
+            case .success(let translatedText):
+                return .single(translatedText)
+            case .backendFailure:
+                // Backend already retried 3x and gave up — no iOS retry
+                return .single(nil)
+            case .iosError:
+                // iOS-side error — retry once instantly
+                print("[AITranslation] iOS retry: retrying incoming translation once")
+                return client.translateStrictDetailed(
+                    text: text,
+                    direction: "incoming",
+                    chatId: chatIdInt,
+                    context: context
+                )
+                |> map { retryResult -> String? in
+                    if case .success(let retryText) = retryResult {
+                        return retryText
+                    }
+                    print("[AITranslation] iOS retry: incoming second attempt also failed")
+                    return nil
+                }
+            }
+        }
+    }
+
     // MARK: - Batch Translation for ExperimentalInternalTranslationService
 
     /// Translates a batch of texts for the built-in translation system.

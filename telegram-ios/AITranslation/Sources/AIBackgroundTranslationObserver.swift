@@ -7,11 +7,16 @@ import AccountContext
 /// Observes incoming messages at the data layer and pre-translates them
 /// so translations are available before the user opens the chat.
 ///
-/// Three mechanisms:
+/// Two mechanisms:
 /// 1. Primary: `aiNewIncomingMessagesCallback` from AccountStateManager — fires for ALL new incoming messages
 ///    (bypasses notification filtering that excludes muted chats).
-/// 2. Secondary: `notificationMessages` subscription — catches notification-worthy messages.
-/// 3. Catch-up: `translateMessages(peerId:context:)` scans recent messages when a chat opens.
+/// 2. Catch-up: `translateMessages(peerId:context:)` scans recent messages when a chat opens.
+///
+/// All translation uses individual requests with `translateIncomingStrict()`:
+/// - Failure detection via `StrictTranslationResult` (backend flag vs iOS error)
+/// - 1 instant retry on iOS-side errors
+/// - On final failure: stores nothing — message stays in original language
+/// - On next chat open: catch-up picks up untranslated messages automatically
 public final class AIBackgroundTranslationObserver {
     private static var shared: AIBackgroundTranslationObserver?
     private static var storedContext: AccountContext?
@@ -21,9 +26,6 @@ public final class AIBackgroundTranslationObserver {
         let saved = AITranslationSettings.translationStartTimestamp
         return saved > 0 ? saved : Int32(Date().timeIntervalSince1970)
     }
-
-    /// Retry delays in seconds for failed translations
-    private static let retryDelays: [Double] = [2.0, 5.0, 10.0]
 
     /// Track message IDs currently being translated to prevent duplicate requests
     private static var inFlightMessageIds = Set<MessageId>()
@@ -46,7 +48,7 @@ public final class AIBackgroundTranslationObserver {
     // MARK: - Primary: Translate by Message IDs (from AccountStateManager callback)
 
     /// Called by `aiNewIncomingMessagesCallback` for every new real-time incoming message.
-    /// Reads messages from Postbox, filters, batch translates, and stores results.
+    /// Reads messages from Postbox, filters, and translates individually.
     private static func translateMessageIds(_ ids: [MessageId]) {
         guard AITranslationSettings.enabled, AITranslationSettings.autoTranslateIncoming else { return }
         guard let context = storedContext else { return }
@@ -82,237 +84,23 @@ public final class AIBackgroundTranslationObserver {
                 Self.inFlightMessageIds.insert(msgId)
             }
 
-            if AITranslationSettings.incomingContextMode == 2 {
-                return Self.translateWithContext(messages: toTranslate, context: context)
-            } else {
-                return Self.translateBatchMessages(messages: toTranslate, context: context)
-            }
+            Self.translateIndividuallyWithRetry(
+                messages: toTranslate,
+                context: context,
+                onAllComplete: {}
+            )
+            return .complete()
         }).start()
     }
 
-    // MARK: - Batch Translation (no context)
+    // MARK: - Unified Individual Translation (real-time + catch-up)
 
-    private static func translateBatchMessages(messages: [(MessageId, String, PeerId)], context: AccountContext) -> Signal<Void, NoError> {
-        var textDict: [AnyHashable: String] = [:]
-        var idMap: [String: MessageId] = [:]
-        for (i, (msgId, text, _)) in messages.enumerated() {
-            let key = "\(i)"
-            textDict[key as AnyHashable] = text
-            idMap[key] = msgId
-        }
-
-        return AITranslationService.shared.translateTexts(texts: textDict, fromLang: "de", toLang: "en")
-        |> mapToSignal { results -> Signal<Void, NoError> in
-            // Clear in-flight tracking
-            DispatchQueue.main.async {
-                for (msgId, _, _) in messages {
-                    Self.inFlightMessageIds.remove(msgId)
-                }
-            }
-
-            guard let results = results else {
-                // All failed (network error / timeout), schedule retry
-                print("[AITranslation] Batch translation returned nil, scheduling retry for \(messages.count) messages")
-                Self.scheduleRetry(ids: messages.map { $0.0 }, attempt: 0, context: context)
-                return .complete()
-            }
-            return context.account.postbox.transaction { transaction in
-                var failedIds: [MessageId] = []
-                for (key, msgId) in idMap {
-                    if let translatedText = results[key as AnyHashable] {
-                        // Store translation even if identical to original (message was already
-                        // in target language). This prevents infinite re-translation loops.
-                        Self.storeTranslation(transaction: transaction, msgId: msgId, translatedText: translatedText)
-                    } else {
-                        failedIds.append(msgId)
-                    }
-                }
-                if !failedIds.isEmpty {
-                    print("[AITranslation] \(failedIds.count) translations failed, scheduling retry")
-                    DispatchQueue.main.async {
-                        Self.scheduleRetry(ids: failedIds, attempt: 0, context: context)
-                    }
-                }
-            } |> map { _ in }
-        }
-    }
-
-    // MARK: - Context-Aware Translation (individual requests with conversation context)
-
-    private static func translateWithContext(messages: [(MessageId, String, PeerId)], context: AccountContext) -> Signal<Void, NoError> {
-        // Group by peerId (chat)
-        var chatGroups: [PeerId: [(MessageId, String)]] = [:]
-        for (msgId, text, peerId) in messages {
-            chatGroups[peerId, default: []].append((msgId, text))
-        }
-
-        var signals: [Signal<Void, NoError>] = []
-
-        for (peerId, chatMessages) in chatGroups {
-            let chatSignal = ConversationContextProvider.getContext(
-                chatId: peerId,
-                context: context,
-                direction: "incoming"
-            )
-            |> mapToSignal { contextMessages -> Signal<Void, NoError> in
-                // Translate each message individually with context
-                let translateSignals: [Signal<(MessageId, String)?, NoError>] = chatMessages.map { (msgId, text) in
-                    return AITranslationService.shared.translateIncomingWithContext(
-                        text: text,
-                        chatId: peerId,
-                        context: contextMessages
-                    )
-                    |> map { translatedText -> (MessageId, String)? in
-                        // Always return result, even if identical — store to prevent re-translation
-                        return (msgId, translatedText)
-                    }
-                }
-
-                return combineLatest(translateSignals)
-                |> mapToSignal { results -> Signal<Void, NoError> in
-                    let succeeded = results.compactMap { $0 }
-
-                    let storeSignal: Signal<Void, NoError> = succeeded.isEmpty ? .complete() :
-                        context.account.postbox.transaction { transaction in
-                            for (msgId, translatedText) in succeeded {
-                                Self.storeTranslation(transaction: transaction, msgId: msgId, translatedText: translatedText)
-                            }
-                        } |> map { _ in }
-
-                    return storeSignal
-                }
-            }
-            signals.append(chatSignal)
-        }
-
-        return combineLatest(signals) |> map { _ in }
-    }
-
-    // MARK: - Retry Mechanism
-
-    private static func scheduleRetry(ids: [MessageId], attempt: Int, context: AccountContext) {
-        guard attempt < retryDelays.count else {
-            print("[AITranslation] All \(retryDelays.count) retries exhausted for \(ids.count) messages")
-            return
-        }
-        let delay = retryDelays[attempt]
-        print("[AITranslation] Scheduling retry \(attempt + 1)/\(retryDelays.count) for \(ids.count) messages in \(delay)s")
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            let _ = (context.account.postbox.transaction { transaction -> [(MessageId, String, PeerId)] in
-                var toRetry: [(MessageId, String, PeerId)] = []
-                for id in ids {
-                    guard let message = transaction.getMessage(id) else { continue }
-                    if !message.text.isEmpty,
-                       !message.attributes.contains(where: { $0 is TranslationMessageAttribute }) {
-                        toRetry.append((id, message.text, id.peerId))
-                    }
-                }
-                return toRetry
-            }
-            |> deliverOnMainQueue
-            |> mapToSignal { toRetry -> Signal<Void, NoError> in
-                guard !toRetry.isEmpty else {
-                    print("[AITranslation] Retry \(attempt + 1): all messages already translated")
-                    return .complete()
-                }
-                print("[AITranslation] Retry \(attempt + 1): retrying \(toRetry.count) messages")
-
-                if AITranslationSettings.incomingContextMode == 2 {
-                    return Self.translateWithContextRetry(messages: toRetry, attempt: attempt, context: context)
-                } else {
-                    return Self.translateBatchRetry(messages: toRetry, attempt: attempt, context: context)
-                }
-            }).start()
-        }
-    }
-
-    private static func translateBatchRetry(messages: [(MessageId, String, PeerId)], attempt: Int, context: AccountContext) -> Signal<Void, NoError> {
-        var textDict: [AnyHashable: String] = [:]
-        var idMap: [String: MessageId] = [:]
-        for (i, (msgId, text, _)) in messages.enumerated() {
-            let key = "\(i)"
-            textDict[key as AnyHashable] = text
-            idMap[key] = msgId
-        }
-
-        return AITranslationService.shared.translateTexts(texts: textDict, fromLang: "de", toLang: "en")
-        |> mapToSignal { results -> Signal<Void, NoError> in
-            guard let results = results else {
-                Self.scheduleRetry(ids: messages.map { $0.0 }, attempt: attempt + 1, context: context)
-                return .complete()
-            }
-            return context.account.postbox.transaction { transaction in
-                var stillFailed: [MessageId] = []
-                for (key, msgId) in idMap {
-                    if let translatedText = results[key as AnyHashable] {
-                        // Store even if identical to original — prevents re-translation loops
-                        Self.storeTranslation(transaction: transaction, msgId: msgId, translatedText: translatedText)
-                    } else {
-                        stillFailed.append(msgId)
-                    }
-                }
-                if !stillFailed.isEmpty {
-                    DispatchQueue.main.async {
-                        Self.scheduleRetry(ids: stillFailed, attempt: attempt + 1, context: context)
-                    }
-                }
-            } |> map { _ in }
-        }
-    }
-
-    private static func translateWithContextRetry(messages: [(MessageId, String, PeerId)], attempt: Int, context: AccountContext) -> Signal<Void, NoError> {
-        var chatGroups: [PeerId: [(MessageId, String)]] = [:]
-        for (msgId, text, peerId) in messages {
-            chatGroups[peerId, default: []].append((msgId, text))
-        }
-
-        var signals: [Signal<Void, NoError>] = []
-
-        for (peerId, chatMessages) in chatGroups {
-            let chatSignal = ConversationContextProvider.getContext(
-                chatId: peerId,
-                context: context,
-                direction: "incoming"
-            )
-            |> mapToSignal { contextMessages -> Signal<Void, NoError> in
-                let translateSignals: [Signal<(MessageId, String)?, NoError>] = chatMessages.map { (msgId, text) in
-                    return AITranslationService.shared.translateIncomingWithContext(
-                        text: text,
-                        chatId: peerId,
-                        context: contextMessages
-                    )
-                    |> map { translatedText -> (MessageId, String)? in
-                        return (msgId, translatedText)
-                    }
-                }
-
-                return combineLatest(translateSignals)
-                |> mapToSignal { results -> Signal<Void, NoError> in
-                    let succeeded = results.compactMap { $0 }
-
-                    let storeSignal: Signal<Void, NoError> = succeeded.isEmpty ? .complete() :
-                        context.account.postbox.transaction { transaction in
-                            for (msgId, translatedText) in succeeded {
-                                Self.storeTranslation(transaction: transaction, msgId: msgId, translatedText: translatedText)
-                            }
-                        } |> map { _ in }
-
-                    return storeSignal
-                }
-            }
-            signals.append(chatSignal)
-        }
-
-        return combineLatest(signals) |> map { _ in }
-    }
-
-    // MARK: - Streaming Individual Translation (for catch-up)
-
-    /// Fires N individual /translate requests concurrently. Each result is stored
-    /// in Postbox immediately upon completion — translations appear one-by-one
-    /// in the chat as they arrive, rather than all at once after a long wait.
-    private static func translateIndividuallyStreaming(
+    /// Fires N individual /translate requests concurrently. Each uses translateIncomingStrict()
+    /// which detects failures and retries once. On final failure, stores nothing — message
+    /// stays in original language and will be picked up by catch-up on next chat open.
+    ///
+    /// Works identically for context ON and OFF, real-time and catch-up.
+    private static func translateIndividuallyWithRetry(
         messages: [(MessageId, String, PeerId)],
         context: AccountContext,
         onAllComplete: @escaping () -> Void
@@ -326,6 +114,32 @@ public final class AIBackgroundTranslationObserver {
         var completedCount = 0
 
         let useContext = AITranslationSettings.incomingContextMode == 2
+
+        let doTranslate = { (msgs: [(MessageId, String, PeerId)], ctxByPeer: [PeerId: [AIContextMessage]]) in
+            for (msgId, text, peerId) in msgs {
+                let ctxMessages = ctxByPeer[peerId] ?? []
+                let _ = (AITranslationService.shared.translateIncomingStrict(
+                    text: text, chatId: peerId, context: ctxMessages
+                )
+                |> mapToSignal { translatedText -> Signal<Void, NoError> in
+                    guard let translatedText = translatedText else {
+                        // Failed after retry — store nothing, message stays in original language
+                        print("[AITranslation] Translation failed for msg \(msgId), leaving untranslated")
+                        return .complete()
+                    }
+                    return context.account.postbox.transaction { transaction in
+                        Self.storeTranslation(transaction: transaction, msgId: msgId, translatedText: translatedText)
+                    } |> map { _ in }
+                }
+                |> deliverOnMainQueue).start(completed: {
+                    Self.inFlightMessageIds.remove(msgId)
+                    completedCount += 1
+                    if completedCount == total {
+                        onAllComplete()
+                    }
+                })
+            }
+        }
 
         if useContext {
             // Fetch context once per peer, then fire individual requests
@@ -341,44 +155,11 @@ public final class AIBackgroundTranslationObserver {
             let _ = (combineLatest(contextSignals)
             |> map { pairs in Dictionary(uniqueKeysWithValues: pairs) }
             |> deliverOnMainQueue).start(next: { contextByPeer in
-                for (msgId, text, peerId) in messages {
-                    let ctxMessages = contextByPeer[peerId] ?? []
-                    let _ = (AITranslationService.shared.translateIncomingWithContext(
-                        text: text, chatId: peerId, context: ctxMessages
-                    )
-                    |> mapToSignal { translatedText -> Signal<Void, NoError> in
-                        return context.account.postbox.transaction { transaction in
-                            Self.storeTranslation(transaction: transaction, msgId: msgId, translatedText: translatedText)
-                        } |> map { _ in }
-                    }
-                    |> deliverOnMainQueue).start(completed: {
-                        Self.inFlightMessageIds.remove(msgId)
-                        completedCount += 1
-                        if completedCount == total {
-                            onAllComplete()
-                        }
-                    })
-                }
+                doTranslate(messages, contextByPeer)
             })
         } else {
             // No context: fire individual requests directly
-            for (msgId, text, peerId) in messages {
-                let _ = (AITranslationService.shared.translateIncomingWithContext(
-                    text: text, chatId: peerId, context: []
-                )
-                |> mapToSignal { translatedText -> Signal<Void, NoError> in
-                    return context.account.postbox.transaction { transaction in
-                        Self.storeTranslation(transaction: transaction, msgId: msgId, translatedText: translatedText)
-                    } |> map { _ in }
-                }
-                |> deliverOnMainQueue).start(completed: {
-                    Self.inFlightMessageIds.remove(msgId)
-                    completedCount += 1
-                    if completedCount == total {
-                        onAllComplete()
-                    }
-                })
-            }
+            doTranslate(messages, [:])
         }
     }
 
@@ -392,6 +173,9 @@ public final class AIBackgroundTranslationObserver {
     /// Translations stream back one-by-one (each displayed immediately) rather than
     /// waiting for the entire batch. Messages are processed newest-first so the
     /// bottom of the chat (what the user sees) translates first.
+    ///
+    /// Messages that failed translation previously have no TranslationMessageAttribute,
+    /// so they are automatically picked up here on every chat open.
     public static func translateMessages(peerId: PeerId, context: AccountContext) {
         guard AITranslationSettings.enabled, AITranslationSettings.autoTranslateIncoming else { return }
 
@@ -427,7 +211,7 @@ public final class AIBackgroundTranslationObserver {
                 return
             }
 
-            print("[AITranslation] Catch-up: streaming \(toTranslate.count) messages for \(peerId) (newest first)")
+            print("[AITranslation] Catch-up: translating \(toTranslate.count) messages for \(peerId) (newest first)")
 
             // Mark all as in-flight
             for (msgId, _, _) in toTranslate {
@@ -436,7 +220,7 @@ public final class AIBackgroundTranslationObserver {
 
             // Fire individual requests concurrently — each stores result immediately
             let messages = toTranslate.map { ($0.0, $0.1, peerId) }
-            Self.translateIndividuallyStreaming(
+            Self.translateIndividuallyWithRetry(
                 messages: messages,
                 context: context,
                 onAllComplete: {
@@ -473,11 +257,11 @@ public final class AIBackgroundTranslationObserver {
                 }
                 guard !toTranslate.isEmpty else { continue }
 
-                if AITranslationSettings.incomingContextMode == 2 {
-                    let _ = Self.translateWithContext(messages: toTranslate, context: context).start()
-                } else {
-                    let _ = Self.translateBatchMessages(messages: toTranslate, context: context).start()
-                }
+                Self.translateIndividuallyWithRetry(
+                    messages: toTranslate,
+                    context: context,
+                    onAllComplete: {}
+                )
             }
         }))
     }
