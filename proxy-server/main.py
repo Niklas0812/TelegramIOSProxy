@@ -292,97 +292,19 @@ class TranslationService:
     async def _retry_translate(self, messages: list[dict]) -> str:
         last_exception = None
 
-        # Attempt 1: initial try
-        # Attempts 2+: retries with appropriate strategy per error type
-        # All error types now get 3 retries for maximum reliability
-        max_total_attempts = 10
-
-        empty_delays = [0.5, 1, 2]
-        payment_delays = [5, 5, 5]
-        timeout_delays = [0, 0, 0]
-        server_delays = [1, 2, 4]
-        general_delays = [1, 2, 4]
-
-        empty_retries = 0
-        payment_retries = 0
-        timeout_retries = 0
-        rate_limit_retries = 0
-        server_retries = 0
-        general_retries = 0
-
-        for attempt in range(max_total_attempts):
+        for attempt in range(3):
             try:
                 return await self._call_openrouter(messages)
-            except EmptyResponseError as e:
-                last_exception = e
-                if empty_retries >= len(empty_delays):
-                    break
-                delay = empty_delays[empty_retries]
-                empty_retries += 1
-                self.stats["retries"] += 1
-                logger.warning(
-                    f"Empty response, retry {empty_retries}/3 after {delay}s"
-                )
-                await asyncio.sleep(delay)
-            except PaymentError as e:
-                last_exception = e
-                if payment_retries >= len(payment_delays):
-                    break
-                delay = payment_delays[payment_retries]
-                payment_retries += 1
-                self.stats["retries"] += 1
-                logger.warning(
-                    f"Payment error, retry {payment_retries}/3 after {delay}s"
-                )
-                await asyncio.sleep(delay)
-            except RateLimitError as e:
-                last_exception = e
-                if rate_limit_retries >= 3:
-                    break
-                delay = e.retry_after
-                rate_limit_retries += 1
-                self.stats["retries"] += 1
-                logger.warning(
-                    f"Rate limited, retry {rate_limit_retries}/3 after {delay}s"
-                )
-                await asyncio.sleep(delay)
-            except (httpx.TimeoutException, httpx.ReadError, httpx.ConnectError) as e:
-                last_exception = e
-                if timeout_retries >= len(timeout_delays):
-                    break
-                timeout_retries += 1
-                self.stats["retries"] += 1
-                logger.warning(
-                    f"Connection/timeout error ({type(e).__name__}), "
-                    f"retry {timeout_retries}/3"
-                )
-            except OpenRouterError as e:
-                last_exception = e
-                if server_retries >= len(server_delays):
-                    break
-                delay = server_delays[server_retries]
-                server_retries += 1
-                self.stats["retries"] += 1
-                logger.warning(
-                    f"OpenRouter error, retry {server_retries}/3 after {delay}s: "
-                    f"{type(e).__name__}: {e}"
-                )
-                await asyncio.sleep(delay)
             except Exception as e:
                 last_exception = e
-                if general_retries >= len(general_delays):
-                    break
-                delay = general_delays[general_retries]
-                general_retries += 1
                 self.stats["retries"] += 1
                 logger.warning(
-                    f"Unexpected error, retry {general_retries}/3 after {delay}s: "
-                    f"{type(e).__name__}: {repr(e)}"
+                    f"Attempt {attempt + 1}/3 failed "
+                    f"({type(e).__name__}: {e})"
                 )
-                await asyncio.sleep(delay)
 
         raise TranslationExhaustedError(
-            f"All retries exhausted. Last error: {last_exception}"
+            f"All 3 attempts failed. Last error: {last_exception}"
         )
 
 
@@ -494,6 +416,9 @@ async def get_prompt():
 
 @app.post("/prompt")
 async def set_prompt(update: PromptUpdate):
+    stripped = update.prompt.strip()
+    if len(stripped) < 10:
+        raise HTTPException(status_code=400, detail="Prompt too short (min 10 chars)")
     SYSTEM_PROMPT_PATH.write_text(update.prompt)
     translation_service.update_prompt_cache("legacy", update.prompt)
     logger.info(f"System prompt updated ({len(update.prompt)} chars)")
@@ -516,6 +441,9 @@ async def get_prompt_by_direction(direction: str):
 
 @app.post("/prompt/{direction}")
 async def set_prompt_by_direction(direction: str, update: PromptUpdate):
+    stripped = update.prompt.strip()
+    if len(stripped) < 10:
+        raise HTTPException(status_code=400, detail="Prompt too short (min 10 chars)")
     path = _get_prompt_path(direction)
     path.write_text(update.prompt)
     translation_service.update_prompt_cache(direction, update.prompt)

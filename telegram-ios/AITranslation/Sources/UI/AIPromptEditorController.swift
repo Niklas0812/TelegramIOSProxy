@@ -17,7 +17,9 @@ private final class AIPromptEditorViewController: ViewController {
     private let direction: String
     private var textView: UITextView?
     private var loadingLabel: UILabel?
-    private var disposable: Disposable?
+    private var loadDisposable: Disposable?
+    private var saveDisposable: Disposable?
+    private var isSaving: Bool = false
 
     init(context: AccountContext, direction: String) {
         self.context = context
@@ -44,7 +46,8 @@ private final class AIPromptEditorViewController: ViewController {
     }
 
     deinit {
-        disposable?.dispose()
+        loadDisposable?.dispose()
+        saveDisposable?.dispose()
     }
 
     override func loadDisplayNode() {
@@ -79,7 +82,7 @@ private final class AIPromptEditorViewController: ViewController {
         self.displayNode.view.addSubview(tv)
         self.textView = tv
 
-        self.disposable = (AITranslationService.shared.getPrompt(direction: self.direction)
+        self.loadDisposable = (AITranslationService.shared.getPrompt(direction: self.direction)
         |> deliverOnMainQueue).startStrict(next: { [weak self] prompt in
             guard let self = self else { return }
             self.loadingLabel?.removeFromSuperview()
@@ -113,14 +116,37 @@ private final class AIPromptEditorViewController: ViewController {
     }
 
     @objc private func saveTapped() {
+        // Prevent double-tap while save is in-flight
+        guard !isSaving else { return }
+
         guard let text = textView?.text else { return }
 
+        // Validate minimum length
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 10 else {
+            let presentationData = self.context.sharedContext.currentPresentationData.with { $0 }
+            let undoController = UndoOverlayController(
+                presentationData: presentationData,
+                content: .info(
+                    title: nil,
+                    text: "Prompt too short (minimum 10 characters)",
+                    timeout: nil,
+                    customUndoText: nil
+                ),
+                elevatedLayout: false,
+                action: { _ in return false }
+            )
+            self.context.sharedContext.mainWindow?.present(undoController, on: .root)
+            return
+        }
+
+        isSaving = true
         self.navigationItem.rightBarButtonItem?.isEnabled = false
 
-        self.disposable?.dispose()
-        self.disposable = (AITranslationService.shared.setPrompt(text, direction: self.direction)
+        self.saveDisposable = (AITranslationService.shared.setPrompt(text, direction: self.direction)
         |> deliverOnMainQueue).startStrict(next: { [weak self] success in
             guard let self = self else { return }
+            self.isSaving = false
             self.navigationItem.rightBarButtonItem?.isEnabled = true
 
             let presentationData = self.context.sharedContext.currentPresentationData.with { $0 }
