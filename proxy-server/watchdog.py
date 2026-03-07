@@ -11,6 +11,7 @@ Lifecycle (simple, predictable, foolproof):
 Uses only stdlib — no pip dependencies required.
 """
 
+import os
 import subprocess
 import sys
 import time
@@ -21,6 +22,7 @@ HEALTH_URL = "https://telegramtranslation.duckdns.org/health"
 HEALTH_TIMEOUT_SECONDS = 2
 STARTUP_DELAY_SECONDS = 5
 BACKEND_SERVICE_NAME = "TranslateGramBackend"
+NSSM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nssm.exe")
 
 
 def check_health() -> bool:
@@ -35,12 +37,11 @@ def check_health() -> bool:
 def restart_backend() -> None:
     try:
         subprocess.run(
-            ["nssm", "restart", BACKEND_SERVICE_NAME],
+            [NSSM_PATH, "restart", BACKEND_SERVICE_NAME],
             timeout=10,
             capture_output=True,
         )
     except Exception:
-        # If nssm restart fails, try net stop + net start
         try:
             subprocess.run(["net", "stop", BACKEND_SERVICE_NAME], timeout=10, capture_output=True)
         except Exception:
@@ -51,10 +52,8 @@ def main() -> None:
     time.sleep(STARTUP_DELAY_SECONDS)
 
     if check_health():
-        # Backend is healthy — exit cleanly. NSSM will restart us for the next cycle.
         sys.exit(0)
     else:
-        # Backend is frozen or down — restart it, then exit.
         restart_backend()
         sys.exit(1)
 

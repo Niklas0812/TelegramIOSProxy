@@ -1,6 +1,6 @@
 @echo off
 REM TranslateGram Watchdog — NSSM Service Installer
-REM Registers and starts the watchdog as a headless Windows service.
+REM Fully unregisters any existing service, then registers and starts fresh.
 REM The watchdog checks backend health every cycle and restarts it if frozen.
 REM Run as Administrator.
 
@@ -8,11 +8,13 @@ setlocal
 
 set SERVICE_NAME=TranslateGramWatchdog
 set SCRIPT_DIR=%~dp0
-set VENV_DIR=%SCRIPT_DIR%venv
-set NSSM=%SCRIPT_DIR%nssm.exe
+REM Remove trailing backslash to avoid quoting issues
+set SCRIPT_DIR=%SCRIPT_DIR:~0,-1%
+set VENV_DIR=%SCRIPT_DIR%\venv
+set NSSM=%SCRIPT_DIR%\nssm.exe
 set PYTHON=%VENV_DIR%\Scripts\python.exe
-set WATCHDOG_PY=%SCRIPT_DIR%watchdog.py
-set LOG_DIR=%SCRIPT_DIR%logs
+set WATCHDOG_PY=%SCRIPT_DIR%\watchdog.py
+set LOG_DIR=%SCRIPT_DIR%\logs
 
 REM Check nssm exists
 if not exist "%NSSM%" (
@@ -20,6 +22,14 @@ if not exist "%NSSM%" (
     pause
     exit /b 1
 )
+
+REM --- FULL CLEANUP ---
+echo Stopping and removing existing %SERVICE_NAME% service...
+sc stop %SERVICE_NAME% >nul 2>&1
+timeout /t 2 /nobreak >nul
+sc delete %SERVICE_NAME% >nul 2>&1
+timeout /t 2 /nobreak >nul
+echo Done.
 
 REM Create logs directory
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
@@ -30,13 +40,11 @@ if not exist "%VENV_DIR%" (
     python -m venv "%VENV_DIR%"
 )
 
-REM Remove existing service if present
-"%NSSM%" stop %SERVICE_NAME% >nul 2>&1
-"%NSSM%" remove %SERVICE_NAME% confirm >nul 2>&1
-
-REM Install service
+REM --- FRESH INSTALL ---
+echo.
 echo Installing %SERVICE_NAME% service...
-"%NSSM%" install %SERVICE_NAME% "%PYTHON%" "%WATCHDOG_PY%"
+"%NSSM%" install %SERVICE_NAME% "%PYTHON%"
+"%NSSM%" set %SERVICE_NAME% AppParameters -u "%WATCHDOG_PY%"
 "%NSSM%" set %SERVICE_NAME% AppDirectory "%SCRIPT_DIR%"
 "%NSSM%" set %SERVICE_NAME% DisplayName "TranslateGram Watchdog"
 "%NSSM%" set %SERVICE_NAME% Description "Health monitor for TranslateGram backend"
@@ -44,8 +52,6 @@ echo Installing %SERVICE_NAME% service...
 REM Logging
 "%NSSM%" set %SERVICE_NAME% AppStdout "%LOG_DIR%\watchdog_stdout.log"
 "%NSSM%" set %SERVICE_NAME% AppStderr "%LOG_DIR%\watchdog_stderr.log"
-"%NSSM%" set %SERVICE_NAME% AppStdoutCreationDisposition 4
-"%NSSM%" set %SERVICE_NAME% AppStderrCreationDisposition 4
 "%NSSM%" set %SERVICE_NAME% AppRotateFiles 1
 "%NSSM%" set %SERVICE_NAME% AppRotateBytes 1048576
 
@@ -55,6 +61,7 @@ REM Auto-start on boot, restart on ANY exit (this is the cycle mechanism)
 "%NSSM%" set %SERVICE_NAME% AppRestartDelay 0
 
 REM Start the service
+echo.
 echo Starting %SERVICE_NAME%...
 "%NSSM%" start %SERVICE_NAME%
 

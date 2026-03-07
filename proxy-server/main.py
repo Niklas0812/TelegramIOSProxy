@@ -256,7 +256,8 @@ class TranslationService:
         logger.info(
             f"chat_id={request.chat_id} dir={request.direction} "
             f"ctx={len(request.context)} len={len(request.text)} "
-            f"ms={elapsed_ms:.0f} fail={translation_failed}"
+            f"ms={elapsed_ms:.0f} fail={translation_failed} "
+            f"| {request.text[:80]} -> {translated_text[:80] if translated_text else 'NONE'}"
         )
 
 
@@ -562,4 +563,4 @@ if __name__ == "__main__":
     import uvicorn
 
     logger.info(f"Starting TranslateGram backend on {HOST}:{PORT} model={OPENROUTER_MODEL}")
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    uvicorn.run(app, host=HOST, port=8081, log_level="warning")

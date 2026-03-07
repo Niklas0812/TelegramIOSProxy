@@ -190,7 +190,7 @@ else
 fi
 
 # 16. Hide translation pop-up bar in ChatControllerNode
-echo "  [16/17] Hiding translation bar in ChatControllerNode.swift..."
+echo "  [16/18] Hiding translation bar in ChatControllerNode.swift..."
 CHAT_CTRL_NODE="${TARGET_DIR}/submodules/TelegramUI/Sources/ChatControllerNode.swift"
 if grep -q "AI Translation: hide translation bar" "$CHAT_CTRL_NODE" 2>/dev/null; then
     echo "    Already patched, skipping."
@@ -199,8 +199,18 @@ else
     echo "    Done."
 fi
 
-# 17. Apply any additional .patch files
-echo "  [17/17] Applying additional patch files..."
+# 17. Patch ChatController.swift for media caption translation
+echo "  [17/18] Patching ChatController.swift for media caption translation..."
+CHAT_CTRL="${TARGET_DIR}/submodules/TelegramUI/Sources/ChatController.swift"
+if grep -q "AI Translation: media caption translation guard" "$CHAT_CTRL" 2>/dev/null; then
+    echo "    Already patched, skipping."
+else
+    python3 "${SCRIPT_DIR}/patch_chat_controller.py" "$CHAT_CTRL"
+    echo "    Done."
+fi
+
+# 18. Apply any additional .patch files
+echo "  [18/18] Applying additional patch files..."
 PATCH_COUNT=0
 for patch_file in "${PATCHES_DIR}"/*.patch; do
     [ -f "$patch_file" ] || continue
