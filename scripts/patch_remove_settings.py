@@ -19,32 +19,35 @@ def patch_remove_settings(filepath: str) -> None:
 
     original_len = len(content)
 
-    # Remove "Devices" entry — matches the multi-line items[...].append(...) block
-    # containing Settings_Devices. Uses [\s\S]*? for nested parentheses (label: .text(...))
-    devices_pattern = re.compile(
-        r'\n\s*items\[[^\]]+\]!\s*\.append\(PeerInfoScreenDisclosureItem\([\s\S]*?'
-        r'Settings_Devices[\s\S]*?'
-        r'interaction\.openSettings\(\.devices\)\s*\n\s*\}\)\)',
-        re.DOTALL
-    )
-    match = devices_pattern.search(content)
-    if match:
-        content = content[:match.start()] + "\n        // AI Translation: removed Devices setting" + content[match.end():]
-        print("Removed Devices settings entry")
+    # Remove "Devices" entry — find the line containing Settings_Devices and remove
+    # the full 3-line append block (items[...].append(...\n...\n    }))
+    devices_target = "presentationData.strings.Settings_Devices"
+    if devices_target in content:
+        # Find the line, then expand to the full append block
+        idx = content.index(devices_target)
+        # Walk back to find "items[" at line start
+        block_start = content.rfind("\n", 0, idx)
+        # Walk forward to find "}))""
+        block_end = content.find("}))", idx) + 3
+        if block_start >= 0 and block_end > 3:
+            content = content[:block_start] + "\n        // AI Translation: removed Devices setting" + content[block_end:]
+            print("Removed Devices settings entry")
+        else:
+            print("WARNING: Could not determine Devices block boundaries")
     else:
         print("WARNING: Could not find Devices settings entry")
 
-    # Remove "Privacy and Security" entry
-    privacy_pattern = re.compile(
-        r'\n\s*items\[[^\]]+\]!\s*\.append\(PeerInfoScreenDisclosureItem\([^)]*?'
-        r'(?:Settings_PrivacySettings|PrivacySettings|privacyAndSecurity)[^)]*?'
-        r'action:\s*\{[^}]*?\}\)\)',
-        re.DOTALL
-    )
-    match = privacy_pattern.search(content)
-    if match:
-        content = content[:match.start()] + "\n        // AI Translation: removed Privacy and Security setting" + content[match.end():]
-        print("Removed Privacy and Security settings entry")
+    # Remove "Privacy and Security" entry — same approach
+    privacy_target = "Settings_PrivacySettings"
+    if privacy_target in content:
+        idx = content.index(privacy_target)
+        block_start = content.rfind("\n", 0, idx)
+        block_end = content.find("}))", idx) + 3
+        if block_start >= 0 and block_end > 3:
+            content = content[:block_start] + "\n        // AI Translation: removed Privacy and Security setting" + content[block_end:]
+            print("Removed Privacy and Security settings entry")
+        else:
+            print("WARNING: Could not determine Privacy block boundaries")
     else:
         print("WARNING: Could not find Privacy and Security settings entry")
 
