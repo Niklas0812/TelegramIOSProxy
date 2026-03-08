@@ -19,21 +19,42 @@ def patch_remove_settings(filepath: str) -> None:
 
     original_len = len(content)
 
-    # Remove "Devices" entry — find the line containing Settings_Devices and remove
-    # the full 3-line append block (items[...].append(...\n...\n    }))
+    # Remove "Devices" entry — the append block AND the devicesLabel variable
+    # (Swift treats unused variables as errors with -whole-module-optimization)
     devices_target = "presentationData.strings.Settings_Devices"
     if devices_target in content:
-        # Find the line, then expand to the full append block
+        # 1. Remove the items[].append() block
         idx = content.index(devices_target)
-        # Walk back to find "items[" at line start
         block_start = content.rfind("\n", 0, idx)
-        # Walk forward to find "}))""
         block_end = content.find("}))", idx) + 3
         if block_start >= 0 and block_end > 3:
             content = content[:block_start] + "\n        // AI Translation: removed Devices setting" + content[block_end:]
             print("Removed Devices settings entry")
-        else:
-            print("WARNING: Could not determine Devices block boundaries")
+
+        # 2. Remove the devicesLabel variable declaration + if/else block
+        devices_label_target = "let devicesLabel: String"
+        if devices_label_target in content:
+            dl_idx = content.index(devices_label_target)
+            dl_start = content.rfind("\n", 0, dl_idx)
+            # Find the closing "}" of the outer if/else, then the empty line after
+            # Pattern: let devicesLabel ... if ... { ... } else { ... }
+            # Count braces to find the matching close
+            brace_start = content.find("{", dl_idx)
+            if brace_start >= 0:
+                depth = 0
+                pos = brace_start
+                while pos < len(content):
+                    if content[pos] == "{":
+                        depth += 1
+                    elif content[pos] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            # Found outermost closing brace
+                            dl_end = pos + 1
+                            content = content[:dl_start] + content[dl_end:]
+                            print("Removed devicesLabel variable")
+                            break
+                    pos += 1
     else:
         print("WARNING: Could not find Devices settings entry")
 
