@@ -102,8 +102,7 @@ def patch_chat_controller(filepath: str) -> None:
                                 newAttributes.append(TranslationMessageAttribute(text: text, entities: [], toLang: "en"))
                                 newMessages[aiCaptionIdx] = .message(text: translatedText, attributes: newAttributes, inlineStickers: inlineStickers, mediaReference: mediaReference, threadId: threadId, replyToMessageId: replyToMessageId, replyToStoryId: replyToStoryId, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: bubbleUpEmojiOrStickersets)
                             }
-                            // Use enqueueMessages() directly — bypasses sendMessages() which strips TranslationMessageAttribute
-                            let _ = enqueueMessages(account: self.context.account, peerId: aiPeerId, messages: newMessages).start()
+                            self.sendMessages(newMessages)
                         } else {
                             // Translation failed — send original untranslated to preserve media
                             self.sendMessages(aiOriginalMessages)

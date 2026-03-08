@@ -20,11 +20,11 @@ def patch_remove_settings(filepath: str) -> None:
     original_len = len(content)
 
     # Remove "Devices" entry — matches the multi-line items[...].append(...) block
-    # containing Settings_Devices or AuthSessions
+    # containing Settings_Devices. Uses [\s\S]*? for nested parentheses (label: .text(...))
     devices_pattern = re.compile(
-        r'\n\s*items\[[^\]]+\]!\s*\.append\(PeerInfoScreenDisclosureItem\([^)]*?'
-        r'(?:Settings_Devices|Devices|AuthSessions)[^)]*?'
-        r'action:\s*\{[^}]*?\}\)\)',
+        r'\n\s*items\[[^\]]+\]!\s*\.append\(PeerInfoScreenDisclosureItem\([\s\S]*?'
+        r'Settings_Devices[\s\S]*?'
+        r'interaction\.openSettings\(\.devices\)\s*\n\s*\}\)\)',
         re.DOTALL
     )
     match = devices_pattern.search(content)

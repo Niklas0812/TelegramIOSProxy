@@ -220,11 +220,11 @@ fi
 
 # 19. Hide Telegram Service Notifications chat (peer 777000)
 echo "  [19/20] Hiding Service Notifications chat from chat list..."
-CHAT_LIST_NODE="${TARGET_DIR}/submodules/ChatListUI/Sources/Node/ChatListNode.swift"
-if grep -q "AI Translation: hide service notifications" "$CHAT_LIST_NODE" 2>/dev/null; then
+CHAT_LIST_ENTRIES="${TARGET_DIR}/submodules/ChatListUI/Sources/Node/ChatListNodeEntries.swift"
+if grep -q "AI Translation: hide service notifications" "$CHAT_LIST_ENTRIES" 2>/dev/null; then
     echo "    Already patched, skipping."
 else
-    python3 "${SCRIPT_DIR}/patch_hide_service_chat.py" "$CHAT_LIST_NODE"
+    python3 "${SCRIPT_DIR}/patch_hide_service_chat.py" "$CHAT_LIST_ENTRIES"
     echo "    Done."
 fi
 
