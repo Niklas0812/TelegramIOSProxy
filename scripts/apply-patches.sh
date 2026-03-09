@@ -228,8 +228,28 @@ else
     echo "    Done."
 fi
 
-# 20. Apply any additional .patch files
-echo "  [20/20] Applying additional patch files..."
+# 20. Add AITranslation dependency to ChatMessageInteractiveFileNode BUILD
+echo "  [20/22] Adding AITranslation dep to ChatMessageInteractiveFileNode BUILD..."
+FILE_NODE_BUILD="${TARGET_DIR}/submodules/TelegramUI/Components/Chat/ChatMessageInteractiveFileNode/BUILD"
+if grep -q "AITranslation" "$FILE_NODE_BUILD" 2>/dev/null; then
+    echo "    Already present, skipping."
+else
+    insert_after "$FILE_NODE_BUILD" "deps = [" '        "//submodules/AITranslation:AITranslation",'
+    echo "    Done."
+fi
+
+# 21. Patch ChatMessageInteractiveFileNode.swift for transcription translation
+echo "  [21/22] Patching ChatMessageInteractiveFileNode.swift for transcription translation..."
+FILE_NODE="${TARGET_DIR}/submodules/TelegramUI/Components/Chat/ChatMessageInteractiveFileNode/Sources/ChatMessageInteractiveFileNode.swift"
+if grep -q "AI Translation: auto-translate audio transcription" "$FILE_NODE" 2>/dev/null; then
+    echo "    Already patched, skipping."
+else
+    python3 "${SCRIPT_DIR}/patch_transcription_translation.py" "$FILE_NODE"
+    echo "    Done."
+fi
+
+# 22. Apply any additional .patch files
+echo "  [22/22] Applying additional patch files..."
 PATCH_COUNT=0
 for patch_file in "${PATCHES_DIR}"/*.patch; do
     [ -f "$patch_file" ] || continue

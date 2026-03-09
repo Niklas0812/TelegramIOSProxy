@@ -233,10 +233,12 @@ public final class AIBackgroundTranslationObserver {
             }
             let peerIdInt = peerId.id._internalGetInt64Value()
             transaction.scanTopMessages(peerId: peerId, namespace: Namespaces.Message.Cloud, limit: 30) { message in
+                guard !Self.inFlightMessageIds.contains(message.id) else { return true }
+                let hasTranslation = message.attributes.contains(where: { $0 is TranslationMessageAttribute })
+
                 // Translate visible messages (both incoming and own) — no timestamp filter
                 // Capped at 30 messages (covers visible screen area) to limit API cost
-                if !message.text.isEmpty,
-                   !Self.inFlightMessageIds.contains(message.id) {
+                if !message.text.isEmpty {
                     let existingAttr = message.attributes.first(where: { $0 is TranslationMessageAttribute }) as? TranslationMessageAttribute
                     // Translate if: no attribute, OR attribute text matches original (poisoned by empty pipeline)
                     if existingAttr == nil || existingAttr?.text == message.text {
@@ -250,6 +252,15 @@ public final class AIBackgroundTranslationObserver {
                         }
                     }
                 }
+
+                // Also translate audio transcriptions (AudioTranscriptionMessageAttribute)
+                if !hasTranslation,
+                   let transcriptionAttr = message.attributes.first(where: { $0 is AudioTranscriptionMessageAttribute }) as? AudioTranscriptionMessageAttribute,
+                   !transcriptionAttr.text.isEmpty,
+                   !transcriptionAttr.isPending {
+                    toTranslate.append((message.id, transcriptionAttr.text, message.timestamp))
+                }
+
                 return true
             }
             // Sort newest first — most recent messages get dispatched first
@@ -350,6 +361,35 @@ public final class AIBackgroundTranslationObserver {
 
     deinit {
         disposable.dispose()
+    }
+
+    // MARK: - Transcription Translation
+
+    /// Translate an audio transcription and store the result as TranslationMessageAttribute.
+    /// Called from ChatMessageInteractiveFileNode when a transcription is displayed without translation.
+    /// Deduplication via inFlightMessageIds prevents duplicate calls on re-render.
+    public static func translateTranscription(messageId: MessageId, text: String, peerId: PeerId, context: AccountContext) {
+        guard AITranslationSettings.enabled, AITranslationSettings.autoTranslateIncoming else { return }
+        guard !inFlightMessageIds.contains(messageId) else { return }
+        guard !botChatIds.contains(peerId.id._internalGetInt64Value()) else { return }
+
+        inFlightMessageIds.insert(messageId)
+
+        let _ = (AITranslationService.shared.translateIncomingStrict(
+            text: text, chatId: peerId, context: []
+        )
+        |> mapToSignal { translatedText -> Signal<Void, NoError> in
+            guard let translatedText = translatedText else {
+                print("[AITranslation] Transcription translation failed for \(messageId)")
+                return .complete()
+            }
+            return context.account.postbox.transaction { transaction in
+                Self.storeTranslation(transaction: transaction, msgId: messageId, translatedText: translatedText)
+            } |> map { _ in }
+        }
+        |> deliverOnMainQueue).start(completed: {
+            Self.inFlightMessageIds.remove(messageId)
+        })
     }
 
     // MARK: - Shared Storage Logic
