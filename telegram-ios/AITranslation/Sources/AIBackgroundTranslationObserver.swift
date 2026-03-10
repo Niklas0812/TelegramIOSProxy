@@ -50,7 +50,6 @@ public final class AIBackgroundTranslationObserver {
 
         // Tear down old observer (disposes notificationMessages subscription)
         if shared != nil {
-            print("[AITranslation] Account switch: reinitializing observer")
             shared?.disposable.dispose()
             shared = nil
             inFlightMessageIds.removeAll()
@@ -159,7 +158,6 @@ public final class AIBackgroundTranslationObserver {
                 |> mapToSignal { translatedText -> Signal<Void, NoError> in
                     guard let translatedText = translatedText else {
                         // Failed after retry — store nothing, message stays in original language
-                        print("[AITranslation] Translation failed for msg \(msgId), leaving untranslated")
                         return .complete()
                     }
                     return context.account.postbox.transaction { transaction in
@@ -216,7 +214,6 @@ public final class AIBackgroundTranslationObserver {
 
         // Prevent duplicate catch-up for the same chat
         guard !catchUpInProgress.contains(peerId) else {
-            print("[AITranslation] Catch-up already in progress for \(peerId), skipping")
             return
         }
         catchUpInProgress.insert(peerId)
@@ -273,7 +270,6 @@ public final class AIBackgroundTranslationObserver {
                 return
             }
 
-            print("[AITranslation] Catch-up: translating \(toTranslate.count) messages for \(peerId) (newest first)")
 
             // Mark all as in-flight
             for (msgId, _, _) in toTranslate {
@@ -287,7 +283,6 @@ public final class AIBackgroundTranslationObserver {
                 context: context,
                 onAllComplete: {
                     Self.catchUpInProgress.remove(peerId)
-                    print("[AITranslation] Catch-up completed: \(toTranslate.count) messages for \(peerId)")
                 }
             )
         })
@@ -309,7 +304,6 @@ public final class AIBackgroundTranslationObserver {
         )
         |> take(1)
         |> deliverOnMainQueue).start(next: { view, _ in
-            print("[AITranslation] Account switch catch-up: scanning \(view.entries.count) chats")
             for entry in view.entries {
                 if case let .MessageEntry(entryData) = entry {
                     let peerId = entryData.index.messageIndex.id.peerId
@@ -380,7 +374,6 @@ public final class AIBackgroundTranslationObserver {
         )
         |> mapToSignal { translatedText -> Signal<Void, NoError> in
             guard let translatedText = translatedText else {
-                print("[AITranslation] Transcription translation failed for \(messageId)")
                 return .complete()
             }
             return context.account.postbox.transaction { transaction in

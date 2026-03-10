@@ -105,7 +105,6 @@ public final class AITranslationService {
                     return .single(nil)
                 case .iosError:
                     // iOS-side error (network/decode/empty) — retry once
-                    print("[AITranslation] iOS retry: retrying outgoing translation once")
                     return client.translateStrictDetailed(
                         text: text,
                         direction: "outgoing",
@@ -116,7 +115,6 @@ public final class AITranslationService {
                         if case .success(let retryText) = retryResult {
                             return retryText
                         }
-                        print("[AITranslation] iOS retry: second attempt also failed")
                         return nil
                     }
                 }
@@ -218,7 +216,6 @@ public final class AITranslationService {
                 return .single(nil)
             case .iosError:
                 // iOS-side error — retry once instantly
-                print("[AITranslation] iOS retry: retrying incoming translation once")
                 return client.translateStrictDetailed(
                     text: text,
                     direction: "incoming",
@@ -229,7 +226,6 @@ public final class AITranslationService {
                     if case .success(let retryText) = retryResult {
                         return retryText
                     }
-                    print("[AITranslation] iOS retry: incoming second attempt also failed")
                     return nil
                 }
             }

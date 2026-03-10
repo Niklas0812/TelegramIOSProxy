@@ -6,7 +6,7 @@ import Foundation
 public struct AIStorage<T: Codable> {
     private let key: String
     private let defaultValue: T
-    private let defaults = UserDefaults.standard
+    private static var cache: [String: Any] = [:]
 
     public init(key: String, defaultValue: T) {
         self.key = key
@@ -15,14 +15,20 @@ public struct AIStorage<T: Codable> {
 
     public var wrappedValue: T {
         get {
-            guard let data = defaults.data(forKey: key) else {
+            if let cached = Self.cache[key] as? T {
+                return cached
+            }
+            guard let data = UserDefaults.standard.data(forKey: key) else {
                 return defaultValue
             }
-            return (try? JSONDecoder().decode(T.self, from: data)) ?? defaultValue
+            let value = (try? JSONDecoder().decode(T.self, from: data)) ?? defaultValue
+            Self.cache[key] = value
+            return value
         }
         set {
+            Self.cache[key] = newValue
             if let data = try? JSONEncoder().encode(newValue) {
-                defaults.set(data, forKey: key)
+                UserDefaults.standard.set(data, forKey: key)
             }
         }
     }

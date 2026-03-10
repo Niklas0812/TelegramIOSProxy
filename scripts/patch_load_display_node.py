@@ -53,66 +53,71 @@ def patch_load_display_node(filepath: str) -> None:
     else:
         indent = "                        "
 
-    new_code = f"""{indent}// AI Translation: chronological queue with cascading failure.
-{indent}// Translation fires INSTANTLY per message. Sending is strict chronological order.
-{indent}// On failure: cascade-cancel all subsequent, restore failed text, show error.
-{indent}// Forwards + text-free messages are batched together to preserve album grouping.
-{indent}var aiPassthroughMessages: [EnqueueMessage] = []
-{indent}for aiMsg in transformedMessages {{
-{indent}    switch aiMsg {{
-{indent}    case let .message(text, attributes, inlineStickers, mediaReference, threadId, replyToMessageId, replyToStoryId, localGroupingKey, correlationId, bubbleUpEmojiOrStickersets):
-{indent}        if !text.isEmpty && AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing && !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) {{
-{indent}            AIOutgoingMessageQueue.shared.enqueue(
-{indent}                text: text,
-{indent}                peerId: peerId,
-{indent}                context: strongSelf.context,
-{indent}                sendAction: {{ [weak strongSelf] translatedText -> Bool in
-{indent}                    guard let strongSelf = strongSelf else {{ return false }}
-{indent}                    var newAttributes = attributes
-{indent}                    newAttributes.append(TranslationMessageAttribute(text: text, entities: [], toLang: "en"))
-{indent}                    let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: [.message(text: translatedText, attributes: newAttributes, inlineStickers: inlineStickers, mediaReference: mediaReference, threadId: threadId, replyToMessageId: replyToMessageId, replyToStoryId: replyToStoryId, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: bubbleUpEmojiOrStickersets)]).start()
-{indent}                    return true
-{indent}                }},
-{indent}                restoreAction: {{ [weak strongSelf] originalText in
-{indent}                    guard let strongSelf = strongSelf else {{ return }}
-{indent}                    if let textInputPanelNode = strongSelf.chatDisplayNode.inputPanelNode as? ChatTextInputPanelNode {{
-{indent}                        if textInputPanelNode.text.isEmpty {{
-{indent}                            textInputPanelNode.text = originalText
+    new_code = f"""{indent}// AI Translation: fire-and-forget outgoing translation.
+{indent}// Only intercept if there are text messages that need translation.
+{indent}// Forwards and non-translatable messages use the original send path to avoid duplication.
+{indent}let aiNeedsTranslation = transformedMessages.contains(where: {{
+{indent}    if case let .message(text, _, _, _, _, _, _, _, _, _) = $0 {{
+{indent}        return !text.isEmpty && AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing && !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value())
+{indent}    }}
+{indent}    return false
+{indent}}})
+{indent}if aiNeedsTranslation {{
+{indent}    // Chronological queue with cascading failure.
+{indent}    // Forwards + text-free messages are batched together to preserve album grouping.
+{indent}    var aiPassthroughMessages: [EnqueueMessage] = []
+{indent}    for aiMsg in transformedMessages {{
+{indent}        switch aiMsg {{
+{indent}        case let .message(text, attributes, inlineStickers, mediaReference, threadId, replyToMessageId, replyToStoryId, localGroupingKey, correlationId, bubbleUpEmojiOrStickersets):
+{indent}            if !text.isEmpty && AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing && !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) {{
+{indent}                AIOutgoingMessageQueue.shared.enqueue(
+{indent}                    text: text,
+{indent}                    peerId: peerId,
+{indent}                    context: strongSelf.context,
+{indent}                    sendAction: {{ [weak strongSelf] translatedText -> Bool in
+{indent}                        guard let strongSelf = strongSelf else {{ return false }}
+{indent}                        var newAttributes = attributes
+{indent}                        newAttributes.append(TranslationMessageAttribute(text: text, entities: [], toLang: "en"))
+{indent}                        let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: [.message(text: translatedText, attributes: newAttributes, inlineStickers: inlineStickers, mediaReference: mediaReference, threadId: threadId, replyToMessageId: replyToMessageId, replyToStoryId: replyToStoryId, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: bubbleUpEmojiOrStickersets)]).start()
+{indent}                        return true
+{indent}                    }},
+{indent}                    restoreAction: {{ [weak strongSelf] originalText in
+{indent}                        guard let strongSelf = strongSelf else {{ return }}
+{indent}                        if let textInputPanelNode = strongSelf.chatDisplayNode.inputPanelNode as? ChatTextInputPanelNode {{
+{indent}                            if textInputPanelNode.text.isEmpty {{
+{indent}                                textInputPanelNode.text = originalText
+{indent}                            }}
 {indent}                        }}
+{indent}                    }},
+{indent}                    errorAction: {{ [weak strongSelf] in
+{indent}                        guard let strongSelf = strongSelf else {{ return }}
+{indent}                        strongSelf.present(UndoOverlayController(
+{indent}                            presentationData: strongSelf.presentationData,
+{indent}                            content: .info(title: nil, text: "Translation failed. Message not sent. Try again.", timeout: 5.0, customUndoText: nil),
+{indent}                            elevatedLayout: true,
+{indent}                            action: {{ _ in return false }}
+{indent}                        ), in: .current)
 {indent}                    }}
-{indent}                }},
-{indent}                errorAction: {{ [weak strongSelf] in
-{indent}                    guard let strongSelf = strongSelf else {{ return }}
-{indent}                    strongSelf.present(UndoOverlayController(
-{indent}                        presentationData: strongSelf.presentationData,
-{indent}                        content: .info(title: nil, text: "Translation failed. Message not sent. Try again.", timeout: 5.0, customUndoText: nil),
-{indent}                        elevatedLayout: true,
-{indent}                        action: {{ _ in return false }}
-{indent}                    ), in: .current)
-{indent}                }}
-{indent}            )
-{indent}        }} else {{
+{indent}                )
+{indent}            }} else {{
+{indent}                aiPassthroughMessages.append(aiMsg)
+{indent}            }}
+{indent}        case .forward:
 {indent}            aiPassthroughMessages.append(aiMsg)
 {indent}        }}
-{indent}    case .forward:
-{indent}        aiPassthroughMessages.append(aiMsg)
 {indent}    }}
-{indent}}}
-{indent}// Send all passthrough messages as ONE batch (preserves album grouping for forwards + text-free media)
-{indent}if !aiPassthroughMessages.isEmpty {{
-{indent}    let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: aiPassthroughMessages).start()
-{indent}}}
-{indent}signal = .single([])
-{indent}// AI Translation: clear text input immediately since messages are enqueued asynchronously.
-{indent}// setupSendActionOnViewUpdate() defers clearing until a Postbox view update, which won't
-{indent}// happen until translation completes (1-3s). Bypass it by clearing directly.
-{indent}if let textInputPanelNode = strongSelf.chatDisplayNode.inputPanelNode as? ChatTextInputPanelNode {{
-{indent}    textInputPanelNode.text = ""
-{indent}}}
-{indent}// Cancel the deferred text clear from setupSendActionOnViewUpdate().
-{indent}// Without this, the stored layoutActionOnViewTransition callback fires 1-3s later
-{indent}// when the translated message enters Postbox, wiping any new text the user typed.
-{indent}strongSelf.chatDisplayNode.historyNode.layoutActionOnViewTransition = nil"""
+{indent}    if !aiPassthroughMessages.isEmpty {{
+{indent}        let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: aiPassthroughMessages).start()
+{indent}    }}
+{indent}    signal = .single([])
+{indent}    if let textInputPanelNode = strongSelf.chatDisplayNode.inputPanelNode as? ChatTextInputPanelNode {{
+{indent}        textInputPanelNode.text = ""
+{indent}    }}
+{indent}    strongSelf.chatDisplayNode.historyNode.layoutActionOnViewTransition = nil
+{indent}}} else {{
+{indent}    // No text needs translation — use original send path (prevents forward duplication)
+{indent}    signal = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: transformedMessages)
+{indent}}}"""
 
     content = content.replace(old_line, new_code, 1)
 

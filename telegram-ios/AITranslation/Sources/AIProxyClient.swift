@@ -176,35 +176,29 @@ public final class AIProxyClient {
 
             let task = self.session.dataTask(with: urlRequest) { data, response, error in
                 if let error = error {
-                    print("[AITranslation] Network error: \(error)")
+
                     subscriber.putNext(text)
                     subscriber.putCompletion()
                     return
                 }
 
                 guard let data = data else {
-                    print("[AITranslation] No data received")
+
                     subscriber.putNext(text)
                     subscriber.putCompletion()
                     return
                 }
 
-                if AITranslationSettings.showRawAPIResponses {
-                    if let rawString = String(data: data, encoding: .utf8) {
-                        print("[AITranslation] Raw response: \(rawString)")
-                    }
-                }
+
 
                 do {
                     let response = try JSONDecoder().decode(AITranslateResponse.self, from: data)
                     if response.translationFailed {
-                        print("[AITranslation] Translation failed for text: \(text.prefix(50))...")
                         subscriber.putNext(text)
                     } else {
                         subscriber.putNext(response.translatedText)
                     }
                 } catch {
-                    print("[AITranslation] Decode error: \(error)")
                     subscriber.putNext(text)
                 }
                 subscriber.putCompletion()
@@ -255,14 +249,12 @@ public final class AIProxyClient {
 
             let task = self.session.dataTask(with: urlRequest) { data, response, error in
                 if let error = error {
-                    print("[AITranslation] Strict: network error: \(error)")
                     subscriber.putNext(nil)
                     subscriber.putCompletion()
                     return
                 }
 
                 guard let data = data else {
-                    print("[AITranslation] Strict: no data received")
                     subscriber.putNext(nil)
                     subscriber.putCompletion()
                     return
@@ -271,13 +263,11 @@ public final class AIProxyClient {
                 do {
                     let response = try JSONDecoder().decode(AITranslateResponse.self, from: data)
                     if response.translationFailed || response.translatedText.isEmpty {
-                        print("[AITranslation] Strict: translation failed for: \(text.prefix(50))...")
                         subscriber.putNext(nil)
                     } else {
                         subscriber.putNext(response.translatedText)
                     }
                 } catch {
-                    print("[AITranslation] Strict: decode error: \(error)")
                     subscriber.putNext(nil)
                 }
                 subscriber.putCompletion()
@@ -328,14 +318,12 @@ public final class AIProxyClient {
 
             let task = self.session.dataTask(with: urlRequest) { data, response, error in
                 if let error = error {
-                    print("[AITranslation] Detailed: network error: \(error)")
                     subscriber.putNext(.iosError)
                     subscriber.putCompletion()
                     return
                 }
 
                 guard let data = data else {
-                    print("[AITranslation] Detailed: no data received")
                     subscriber.putNext(.iosError)
                     subscriber.putCompletion()
                     return
@@ -344,16 +332,13 @@ public final class AIProxyClient {
                 do {
                     let response = try JSONDecoder().decode(AITranslateResponse.self, from: data)
                     if response.translationFailed {
-                        print("[AITranslation] Detailed: backend failure for: \(text.prefix(50))...")
                         subscriber.putNext(.backendFailure)
                     } else if response.translatedText.isEmpty {
-                        print("[AITranslation] Detailed: empty translated text for: \(text.prefix(50))...")
                         subscriber.putNext(.iosError)
                     } else {
                         subscriber.putNext(.success(response.translatedText))
                     }
                 } catch {
-                    print("[AITranslation] Detailed: decode error: \(error)")
                     subscriber.putNext(.iosError)
                 }
                 subscriber.putCompletion()
@@ -393,31 +378,23 @@ public final class AIProxyClient {
 
             let task = self.batchSession.dataTask(with: urlRequest) { data, response, error in
                 if let error = error {
-                    print("[AITranslation] Batch network error (\(items.count) items): \(error)")
                     subscriber.putNext([])
                     subscriber.putCompletion()
                     return
                 }
 
                 guard let data = data else {
-                    print("[AITranslation] Batch: no data received")
                     subscriber.putNext([])
                     subscriber.putCompletion()
                     return
                 }
 
-                if AITranslationSettings.showRawAPIResponses {
-                    if let rawString = String(data: data, encoding: .utf8) {
-                        print("[AITranslation] Batch raw response: \(rawString)")
-                    }
-                }
+
 
                 do {
                     let response = try JSONDecoder().decode(AIBatchTranslateResponse.self, from: data)
-                    print("[AITranslation] Batch completed: \(response.results.count)/\(items.count) results")
                     subscriber.putNext(response.results)
                 } catch {
-                    print("[AITranslation] Batch decode error: \(error)")
                     subscriber.putNext([])
                 }
                 subscriber.putCompletion()

@@ -115,7 +115,6 @@ public final class AIOutgoingMessageQueue {
             guard let queue = self.peerQueues[peerId],
                   let entry = queue.first(where: { $0.id == entryId }),
                   case .translating = entry.state else { return }
-            print("[AITranslation] TIMEOUT: entry \(entryId) stuck in .translating for 30s, force-failing")
             entry.translationDisposable.dispose()
             entry.state = .failed
             self.drainQueue(peerId: peerId)
@@ -127,7 +126,6 @@ public final class AIOutgoingMessageQueue {
     private func handleTranslationResult(entryId: Int, peerId: PeerId, result: String?) {
         guard let queue = peerQueues[peerId],
               let entry = queue.first(where: { $0.id == entryId }) else {
-            print("[AITranslation] WARNING: translation result for entry \(entryId) dropped — queue already cleared")
             return
         }
 
@@ -168,7 +166,6 @@ public final class AIOutgoingMessageQueue {
                     i += 1
                 } else {
                     // Controller is gone — still try to show error and restore text
-                    print("[AITranslation] WARNING: sendAction returned false (controller gone) for entry \(entry.id)")
                     entry.restoreAction(entry.originalText)
                     entry.errorAction()
                     for j in (i + 1)..<queue.count {
