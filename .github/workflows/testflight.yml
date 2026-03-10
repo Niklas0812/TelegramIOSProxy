@@ -1,0 +1,205 @@
+name: Build & Upload to TestFlight
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 180
+
+    env:
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      BUNDLE_ID: com.niklas.translategram
+      TEAM_ID: 5RPK5SFG6M
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Clone Telegram-iOS (release-11.13, Xcode 16.2)
+        run: |
+          git clone --branch release-11.13 --depth 1 https://github.com/TelegramMessenger/Telegram-iOS.git telegram-ios-build
+          cd telegram-ios-build
+          git submodule update --init --recursive --depth 1
+
+      - name: Apply modifications
+        run: |
+          cp -r telegram-ios/AITranslation telegram-ios-build/submodules/AITranslation
+          bash scripts/apply-patches.sh telegram-ios-build
+
+      - name: Setup Xcode 16.2
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.2'
+
+      - name: Configure Xcode
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_16.2.app/Contents/Developer
+          sudo xcodebuild -runFirstLaunch 2>/dev/null || true
+          sudo xcodebuild -license accept 2>/dev/null || true
+
+      - name: Write build configuration
+        run: |
+          API_ID="${TELEGRAM_API_ID:-12345}"
+          API_HASH="${TELEGRAM_API_HASH:-abcdef1234567890abcdef1234567890}"
+
+          python3 -c "
+          import json, pathlib
+          cfg = {
+              'bundle_id': '${BUNDLE_ID}',
+              'api_id': '${API_ID}',
+              'api_hash': '${API_HASH}',
+              'team_id': '${TEAM_ID}',
+              'app_center_id': '0',
+              'is_internal_build': 'false',
+              'is_appstore_build': 'true',
+              'appstore_id': '6760355223',
+              'app_specific_url_scheme': 'tg',
+              'premium_iap_product_id': '',
+              'enable_siri': False,
+              'enable_icloud': False
+          }
+          pathlib.Path('telegram-ios-build/build-system/appstore-configuration.json').write_text(json.dumps(cfg, indent=2))
+          "
+
+      - name: Install provisioning profiles
+        run: |
+          PROFILES_DIR="telegram-ios-build/build-system/fake-codesigning/profiles"
+          mkdir -p "$PROFILES_DIR"
+
+          echo "${{ secrets.APPSTORE_PROFILE_TELEGRAM }}" | base64 -d > "$PROFILES_DIR/Telegram.mobileprovision"
+          echo "${{ secrets.APPSTORE_PROFILE_SHARE }}" | base64 -d > "$PROFILES_DIR/Share.mobileprovision"
+          echo "${{ secrets.APPSTORE_PROFILE_WIDGET }}" | base64 -d > "$PROFILES_DIR/Widget.mobileprovision"
+          echo "${{ secrets.APPSTORE_PROFILE_NOTIFICATIONCONTENT }}" | base64 -d > "$PROFILES_DIR/NotificationContent.mobileprovision"
+          echo "${{ secrets.APPSTORE_PROFILE_NOTIFICATIONSERVICE }}" | base64 -d > "$PROFILES_DIR/NotificationService.mobileprovision"
+          echo "${{ secrets.APPSTORE_PROFILE_INTENTS }}" | base64 -d > "$PROFILES_DIR/Intents.mobileprovision"
+          echo "${{ secrets.APPSTORE_PROFILE_BROADCASTUPLOAD }}" | base64 -d > "$PROFILES_DIR/BroadcastUpload.mobileprovision"
+          echo "${{ secrets.APPSTORE_PROFILE_WATCHAPP }}" | base64 -d > "$PROFILES_DIR/WatchApp.mobileprovision"
+          echo "${{ secrets.APPSTORE_PROFILE_WATCHEXTENSION }}" | base64 -d > "$PROFILES_DIR/WatchExtension.mobileprovision"
+
+          echo "Installed $(ls "$PROFILES_DIR"/*.mobileprovision | wc -l) profiles"
+
+      - name: Setup signing keychain
+        run: |
+          KEYCHAIN="build.keychain"
+          KEYCHAIN_PASSWORD="build_password_ci"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          echo "${{ secrets.DIST_CERTIFICATE_P12 }}" | base64 -d > /tmp/signing.p12
+          security import /tmp/signing.p12 -k "$KEYCHAIN" \
+            -P "${{ secrets.DIST_CERTIFICATE_PASSWORD }}" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f /tmp/signing.p12
+
+          curl -sL "https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer" -o /tmp/AppleWWDRCAG3.cer
+          security import /tmp/AppleWWDRCAG3.cer -k "$KEYCHAIN" -T /usr/bin/codesign
+          rm -f /tmp/AppleWWDRCAG3.cer
+
+          EXISTING=$(security list-keychains -d user | tr -d '"' | tr '\n' ' ')
+          security list-keychains -d user -s "$KEYCHAIN" $EXISTING
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          echo "=== Signing identities ==="
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Patch build system for CI
+        run: |
+          python3 scripts/patch_build_configuration.py telegram-ios-build
+
+      - name: Restore Bazel disk cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/bazel-disk-cache
+          key: bazel-disk-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            bazel-disk-${{ runner.os }}-
+
+      - name: Restore Bazel repository cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel-repo
+          key: bazel-repo-${{ runner.os }}-${{ hashFiles('telegram-ios-build/WORKSPACE') }}
+          restore-keys: |
+            bazel-repo-${{ runner.os }}-
+
+      - name: Setup Bazel caches
+        run: |
+          mkdir -p /tmp/bazel-disk-cache ~/.cache/bazel-repo
+
+          echo "build --disk_cache=/tmp/bazel-disk-cache" >> telegram-ios-build/.bazelrc
+          echo "build --experimental_disk_cache_gc_max_size=8G" >> telegram-ios-build/.bazelrc
+          echo "build --repository_cache=$HOME/.cache/bazel-repo" >> telegram-ios-build/.bazelrc
+          echo "build --experimental_remote_cache_compression" >> telegram-ios-build/.bazelrc
+          echo "build --reuse_sandbox_directories" >> telegram-ios-build/.bazelrc
+          echo "startup --host_jvm_args=-Xmx6g" >> telegram-ios-build/.bazelrc
+
+          GCS_KEY='${{ secrets.GCS_SA_KEY }}'
+          if [ -n "$GCS_KEY" ] && [ "$GCS_KEY" != "" ]; then
+            echo "$GCS_KEY" > /tmp/gcs-key.json
+            echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcs-key.json" >> $GITHUB_ENV
+            echo "USE_GCS_CACHE=true" >> $GITHUB_ENV
+            echo "build --google_default_credentials=true" >> telegram-ios-build/.bazelrc
+          else
+            echo "USE_GCS_CACHE=false" >> $GITHUB_ENV
+          fi
+
+      - name: Build IPA
+        working-directory: telegram-ios-build
+        run: |
+          CACHE_FLAG=""
+          if [ "$USE_GCS_CACHE" = "true" ]; then
+            CACHE_FLAG="--cacheHost=https://storage.googleapis.com/translategram-bazel-cache"
+          fi
+
+          python3 build-system/Make/Make.py \
+            $CACHE_FLAG \
+            build \
+            --configurationPath=build-system/appstore-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --buildNumber=${{ github.run_number }} \
+            --configuration=release_arm64
+
+      - name: Upload to TestFlight
+        run: |
+          rm -f /tmp/gcs-key.json
+
+          # Find the IPA
+          IPA_PATH=$(find -L telegram-ios-build -name "*.ipa" -print -quit 2>/dev/null)
+          if [ -z "$IPA_PATH" ]; then
+            echo "ERROR: No IPA found"
+            exit 1
+          fi
+          echo "Found IPA: $IPA_PATH"
+
+          # Write API key for altool/notarytool
+          mkdir -p ~/.private_keys
+          echo '${{ secrets.ASC_API_KEY }}' > ~/.private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+
+          # Upload to App Store Connect (TestFlight)
+          xcrun altool --upload-app \
+            -f "$IPA_PATH" \
+            -t ios \
+            --apiKey ${{ secrets.ASC_KEY_ID }} \
+            --apiIssuer ${{ secrets.ASC_ISSUER_ID }}
+
+          echo "Upload to TestFlight complete!"
+
+      - name: Upload IPA artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: translategram-testflight-${{ github.run_number }}
+          path: |
+            telegram-ios-build/bazel-bin/Telegram/Telegram.ipa
+          retention-days: 30
+          if-no-files-found: warn
