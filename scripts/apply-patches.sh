@@ -248,8 +248,17 @@ else
     echo "    Done."
 fi
 
-# 22. Apply any additional .patch files
-echo "  [22/22] Applying additional patch files..."
+# 22. Patch AppDelegate.swift for notification reply translation
+echo "  [22/23] Patching AppDelegate.swift for notification reply translation..."
+if grep -q "AI Translation: translate notification reply" "$APPDELEGATE" 2>/dev/null; then
+    echo "    Already patched, skipping."
+else
+    python3 "${SCRIPT_DIR}/patch_notification_reply.py" "$APPDELEGATE"
+    echo "    Done."
+fi
+
+# 23. Apply any additional .patch files
+echo "  [23/23] Applying additional patch files..."
 PATCH_COUNT=0
 for patch_file in "${PATCHES_DIR}"/*.patch; do
     [ -f "$patch_file" ] || continue
