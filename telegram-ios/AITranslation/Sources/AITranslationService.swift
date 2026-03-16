@@ -33,8 +33,11 @@ public final class AITranslationService {
         chatId: PeerId,
         context: AccountContext
     ) -> Signal<String, NoError> {
-        guard shouldTranslateOutgoing(chatId: chatId),
-              let client = proxyClient else {
+        guard shouldTranslateOutgoing(chatId: chatId) else {
+            return .single(text)
+        }
+        if proxyClient == nil { updateProxyClient() }
+        guard let client = proxyClient else {
             return .single(text)
         }
 
@@ -71,8 +74,13 @@ public final class AITranslationService {
         chatId: PeerId,
         context: AccountContext
     ) -> Signal<String?, NoError> {
-        guard shouldTranslateOutgoing(chatId: chatId),
-              let client = proxyClient else {
+        guard shouldTranslateOutgoing(chatId: chatId) else {
+            return .single(nil)
+        }
+        if proxyClient == nil {
+            updateProxyClient()
+        }
+        guard let client = proxyClient else {
             return .single(nil)
         }
 
@@ -138,8 +146,11 @@ public final class AITranslationService {
             return .single(cached)
         }
 
-        guard shouldTranslateIncoming(chatId: chatId),
-              let client = proxyClient else {
+        guard shouldTranslateIncoming(chatId: chatId) else {
+            return .single(text)
+        }
+        if proxyClient == nil { updateProxyClient() }
+        guard let client = proxyClient else {
             return .single(text)
         }
 
@@ -302,6 +313,8 @@ public final class AITranslationService {
 
     public func clearCache() {
         cache.clear()
+        AIStorageCache.clear()
+        updateProxyClient()
     }
 
     // MARK: - System Prompt

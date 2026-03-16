@@ -2,8 +2,27 @@ import Foundation
 
 // MARK: - UserDefaults-backed Storage
 
-private final class AIStorageCache {
-    static var values: [String: Any] = [:]
+public final class AIStorageCache {
+    private static let lock = NSLock()
+    private static var _values: [String: Any] = [:]
+
+    static func get(_ key: String) -> Any? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _values[key]
+    }
+
+    static func set(_ key: String, _ value: Any) {
+        lock.lock()
+        defer { lock.unlock() }
+        _values[key] = value
+    }
+
+    public static func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        _values.removeAll()
+    }
 }
 
 @propertyWrapper
@@ -18,18 +37,18 @@ public struct AIStorage<T: Codable> {
 
     public var wrappedValue: T {
         get {
-            if let cached = AIStorageCache.values[key] as? T {
+            if let cached = AIStorageCache.get(key) as? T {
                 return cached
             }
             guard let data = UserDefaults.standard.data(forKey: key) else {
                 return defaultValue
             }
             let value = (try? JSONDecoder().decode(T.self, from: data)) ?? defaultValue
-            AIStorageCache.values[key] = value
+            AIStorageCache.set(key, value)
             return value
         }
         set {
-            AIStorageCache.values[key] = newValue
+            AIStorageCache.set(key, newValue)
             if let data = try? JSONEncoder().encode(newValue) {
                 UserDefaults.standard.set(data, forKey: key)
             }
