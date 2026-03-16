@@ -44,8 +44,10 @@ def patch_notification_reply(filepath: str) -> None:
 
     new_code = """// AI Translation: translate notification reply before sending
                         let aiReplyToMessageId = replyToMessageId
-                        if AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing && !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) {
-                            return AIProxyClient.shared.translateStrict(
+                        let aiProxyURL = AITranslationSettings.proxyServerURL
+                        if AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing && !aiProxyURL.isEmpty && !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) {
+                            let aiClient = AIProxyClient(baseURL: aiProxyURL)
+                            return aiClient.translateStrict(
                                 text: text,
                                 direction: "outgoing",
                                 chatId: peerId.id._internalGetInt64Value(),
@@ -54,11 +56,19 @@ def patch_notification_reply(filepath: str) -> None:
                             |> mapToSignal { translatedText -> Signal<[MessageId?], NoError> in
                                 let finalText = translatedText ?? text
                                 var attributes: [MessageAttribute] = []
-                                if let translatedText = translatedText {
+                                if translatedText != nil {
                                     attributes.append(TranslationMessageAttribute(text: text, entities: [], toLang: "en"))
-                                    let _ = finalText
                                 }
                                 return enqueueMessages(account: account, peerId: peerId, messages: [EnqueueMessage.message(text: finalText, attributes: attributes, inlineStickers: [:], mediaReference: nil, threadId: nil, replyToMessageId: aiReplyToMessageId.flatMap { EngineMessageReplySubject(messageId: $0, quote: nil) }, replyToStoryId: nil, localGroupingKey: nil, correlationId: nil, bubbleUpEmojiOrStickersets: [])])
+                            }
+                            |> mapToSignal { messageIds -> Signal<Void, NoError> in
+                                if let messageId = messageIds.first, let messageId = messageId {
+                                    return account.postbox.unsentMessageIdsView()
+                                    |> filter { view in !view.ids.contains(messageId) }
+                                    |> take(1)
+                                    |> map { _ in }
+                                }
+                                return .complete()
                             }
                         }
                         return enqueueMessages(account: account, peerId: peerId, messages: [EnqueueMessage.message(text: text, attributes: [], inlineStickers: [:], mediaReference: nil, threadId: nil, replyToMessageId: replyToMessageId.flatMap { EngineMessageReplySubject(messageId: $0, quote: nil) }, replyToStoryId: nil, localGroupingKey: nil, correlationId: nil, bubbleUpEmojiOrStickersets: [])])"""
