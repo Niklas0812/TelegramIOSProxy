@@ -16,7 +16,7 @@ public final class AITranslationService {
 
     /// Recreate the proxy client when the URL changes.
     public func updateProxyClient() {
-        let url = AITranslationSettings.proxyServerURL
+        let url = AITranslationSettings.proxyServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !url.isEmpty else {
             proxyClient = nil
             return
@@ -112,8 +112,11 @@ public final class AITranslationService {
                     // Backend already retried 3x and gave up — no iOS retry
                     return .single(nil)
                 case .iosError:
-                    // iOS-side error (network/decode/empty) — retry once
-                    return client.translateStrictDetailed(
+                    // iOS-side error (network/decode/empty) — recreate client with fresh
+                    // URLSession (stale HTTP connections cause instant failures) then retry once
+                    self.updateProxyClient()
+                    guard let freshClient = self.proxyClient else { return .single(nil) }
+                    return freshClient.translateStrictDetailed(
                         text: text,
                         direction: "outgoing",
                         chatId: chatIdInt,
@@ -226,8 +229,10 @@ public final class AITranslationService {
                 // Backend already retried 3x and gave up — no iOS retry
                 return .single(nil)
             case .iosError:
-                // iOS-side error — retry once instantly
-                return client.translateStrictDetailed(
+                // iOS-side error — recreate client with fresh URLSession then retry once
+                self.updateProxyClient()
+                guard let freshClient = self.proxyClient else { return .single(nil) }
+                return freshClient.translateStrictDetailed(
                     text: text,
                     direction: "incoming",
                     chatId: chatIdInt,

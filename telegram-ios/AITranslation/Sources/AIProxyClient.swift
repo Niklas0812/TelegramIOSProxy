@@ -127,7 +127,8 @@ public final class AIProxyClient {
     private let baseURL: String
 
     public init(baseURL: String) {
-        self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.baseURL = trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 20
         config.timeoutIntervalForResource = 25

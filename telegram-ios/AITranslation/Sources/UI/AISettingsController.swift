@@ -465,7 +465,7 @@ public func aiSettingsController(context: AccountContext) -> ViewController {
             alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
             alert.addAction(UIAlertAction(title: "Save", style: .default) { _ in
                 if let newURL = alert.textFields?.first?.text, !newURL.isEmpty {
-                    AITranslationSettings.proxyServerURL = newURL
+                    AITranslationSettings.proxyServerURL = newURL.trimmingCharacters(in: .whitespacesAndNewlines)
                     // Reset start timestamp so only messages from NOW get translated
                     AITranslationSettings.translationStartTimestamp = Int32(Date().timeIntervalSince1970)
                     AITranslationService.shared.updateProxyClient()
