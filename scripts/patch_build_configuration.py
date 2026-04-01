@@ -204,22 +204,14 @@ def patch_entitlements_app_groups(build_dir):
     with open(build_path, "r") as f:
         content = f.read()
 
-    # Replace the app_groups_fragment definition to remove only application-groups
-    # but keep application-identifier. The original looks like:
-    #   app_groups_fragment = """
-    #       <key>com.apple.security.application-groups</key>
-    #       <array><string>group.{telegram_bundle_id}</string></array>
-    #       <key>application-identifier</key>
-    #       <string>{telegram_team_id}.{telegram_bundle_id}</string>
-    #   """.format(...)
-    #
-    # We rewrite it to only contain application-identifier.
+    # Replace the app_groups_fragment to produce an empty string.
+    # application-identifier is injected automatically by Bazel/codesign from
+    # the provisioning profile — having it in the entitlements template is
+    # redundant (and may conflict). Only application-groups needs to be removed
+    # because the profile doesn't have a configured group container.
     new_fragment = re.sub(
-        r'(app_groups_fragment\s*=\s*""").*?("""\.format\([^)]*\))',
-        r'''\1
-    <key>application-identifier</key>
-    <string>{telegram_team_id}.{telegram_bundle_id}</string>
-\2''',
+        r'(app_groups_fragment\s*=\s*""").*?(""")',
+        r'\1\2',
         content,
         flags=re.DOTALL,
     )
@@ -227,7 +219,7 @@ def patch_entitlements_app_groups(build_dir):
     if new_fragment != content:
         with open(build_path, "w") as f:
             f.write(new_fragment)
-        print(f"[5] Rewrote app_groups_fragment: kept application-identifier, removed application-groups")
+        print(f"[5] Emptied app_groups_fragment (removed application-groups + application-identifier)")
     else:
         print(f"[5] app_groups_fragment not found or already patched")
 
