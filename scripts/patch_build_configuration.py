@@ -186,17 +186,15 @@ def patch_remote_downloader(build_dir):
 
 
 def patch_entitlements_app_groups(build_dir):
-    """Remove com.apple.security.application-groups from Telegram entitlements.
+    """Strip only application-groups from app_groups_fragment, keep application-identifier.
 
     Real Apple provisioning profiles created via the API don't include app group
     containers (Apple requires portal UI for that). Bazel's plisttool validates
     that every entitlement key in the app's .entitlements file is also present
-    in the profile with a non-empty value. Since the profile has an empty array,
-    plisttool rejects it.
+    in the profile with a non-empty value.
 
-    Fix: remove app_groups_fragment from the TelegramEntitlements template
-    concatenation in Telegram/BUILD. This prevents the entitlement from being
-    generated in the first place.
+    Fix: rewrite app_groups_fragment to keep application-identifier (required for
+    the app to launch) but remove the application-groups key/array.
     """
     build_path = os.path.join(build_dir, "Telegram", "BUILD")
     if not os.path.exists(build_path):
@@ -206,33 +204,32 @@ def patch_entitlements_app_groups(build_dir):
     with open(build_path, "r") as f:
         content = f.read()
 
-    changed = False
-
-    # Remove app_groups_fragment from the TelegramEntitlements template list
-    # It appears as: app_groups_fragment,
-    if "app_groups_fragment," in content:
-        content = content.replace("app_groups_fragment,\n", "")
-        content = content.replace("app_groups_fragment,", "")
-        changed = True
-        print(f"[5] Removed app_groups_fragment from TelegramEntitlements")
-
-    # Also remove the app_groups_fragment variable definition entirely
-    # It's a multi-line string assignment like:
-    #   app_groups_fragment = """...""".format(...)
-    content = re.sub(
-        r'app_groups_fragment\s*=\s*""".*?"""\.format\([^)]*\)\n',
-        "",
+    # Replace the app_groups_fragment definition to remove only application-groups
+    # but keep application-identifier. The original looks like:
+    #   app_groups_fragment = """
+    #       <key>com.apple.security.application-groups</key>
+    #       <array><string>group.{telegram_bundle_id}</string></array>
+    #       <key>application-identifier</key>
+    #       <string>{telegram_team_id}.{telegram_bundle_id}</string>
+    #   """.format(...)
+    #
+    # We rewrite it to only contain application-identifier.
+    new_fragment = re.sub(
+        r'(app_groups_fragment\s*=\s*""").*?("""\.format\([^)]*\))',
+        r'''\1
+    <key>application-identifier</key>
+    <string>{telegram_team_id}.{telegram_bundle_id}</string>
+\2''',
         content,
         flags=re.DOTALL,
     )
-    if changed or "app_groups_fragment" not in content:
-        print(f"[5] Cleaned up app_groups_fragment definition")
 
-    with open(build_path, "w") as f:
-        f.write(content)
-
-    if not changed:
-        print(f"[5] app_groups_fragment not found in BUILD (may already be removed)")
+    if new_fragment != content:
+        with open(build_path, "w") as f:
+            f.write(new_fragment)
+        print(f"[5] Rewrote app_groups_fragment: kept application-identifier, removed application-groups")
+    else:
+        print(f"[5] app_groups_fragment not found or already patched")
 
 
 def main():
