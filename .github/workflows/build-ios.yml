@@ -16,7 +16,7 @@ jobs:
     env:
       TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
       TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-      BUNDLE_ID: com.niklas.translategram
+      BUNDLE_ID: com.niklas.translategram2
       TEAM_ID: 5RPK5SFG6M
 
     steps:
@@ -104,6 +104,13 @@ jobs:
 
           echo "Installed $(ls "$PROFILES_DIR"/*.mobileprovision | wc -l) profiles"
           ls -la "$PROFILES_DIR"
+
+      - name: Fix provisioning profiles
+        run: |
+          CERTS_DIR="telegram-ios-build/build-system/fake-codesigning/certs"
+          mkdir -p "$CERTS_DIR"
+          echo "${{ secrets.SIGNING_CERTIFICATE_P12 }}" | base64 -d > "$CERTS_DIR/SelfSigned.p12"
+          P12_PASSWORD="${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}" python3 scripts/fix_profile_expiration.py telegram-ios-build
 
       - name: Setup signing keychain
         run: |

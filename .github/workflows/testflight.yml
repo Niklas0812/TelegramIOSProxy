@@ -11,7 +11,7 @@ jobs:
     env:
       TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
       TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-      BUNDLE_ID: com.niklas.translategram
+      BUNDLE_ID: com.niklas.translategram2
       TEAM_ID: 5RPK5SFG6M
 
     steps:

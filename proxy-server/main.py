@@ -660,7 +660,7 @@ async def stats():
 # --- OTA Install ---
 
 OTA_DIR = Path(__file__).parent / "ota"
-OTA_BUNDLE_ID = "com.niklas.translategram"
+OTA_BUNDLE_ID = "com.niklas.translategram2"
 OTA_APP_TITLE = "TranslateGram"
 OTA_BUNDLE_VERSION = "11.13"
 

@@ -32,7 +32,7 @@ PROFILE_SUFFIX_MAP = {
 }
 
 TEAM_ID = '5RPK5SFG6M'
-BUNDLE_ID = 'com.niklas.translategram'
+BUNDLE_ID = 'com.niklas.translategram2'
 
 # Registered device UDIDs (must also be added in Apple Developer portal)
 PROVISIONED_DEVICES = [
