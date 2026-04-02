@@ -213,7 +213,7 @@ jobs:
             --configurationPath=build-system/appstore-configuration.json \
             --codesigningInformationPath=build-system/fake-codesigning \
             --buildNumber=${{ github.run_number }} \
-            --configuration=release_arm64
+            --configuration=debug_arm64
 
           echo ""
           echo "=== Disk cache size ==="
