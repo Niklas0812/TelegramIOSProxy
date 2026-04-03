@@ -341,6 +341,7 @@ public final class AITranslationService {
     // MARK: - Connection Test
 
     public func testConnection() -> Signal<Bool, NoError> {
+        if proxyClient == nil { updateProxyClient() }
         guard let client = proxyClient else {
             return .single(false)
         }

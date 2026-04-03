@@ -491,7 +491,9 @@ public final class AIProxyClient {
         }
 
         return Signal { subscriber in
-            let task = self.session.dataTask(with: url) { data, response, error in
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 4.0
+            let task = self.session.dataTask(with: request) { data, response, error in
                 if let _ = error {
                     subscriber.putNext(false)
                     subscriber.putCompletion()
