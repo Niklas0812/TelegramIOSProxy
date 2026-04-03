@@ -654,16 +654,13 @@ public func aiSettingsController(context: AccountContext) -> ViewController {
 
     // Auto-check connection status every 5 seconds
     let currentCheckDisposable = MetaDisposable()
-    let checkInFlight = Atomic<Bool>(value: false)
 
     let performCheck = {
-        // Skip if a check is already in flight (prevents pileup on slow connections)
-        guard checkInFlight.with({ !$0 }) else { return }
-        let _ = checkInFlight.modify { _ in true }
-
+        // MetaDisposable.set() cancels any previous in-flight check automatically.
+        // If the server is hanging, the old request is cancelled and a fresh one starts.
+        // This guarantees: if server goes down, status updates within one tick (5s).
         currentCheckDisposable.set((AITranslationService.shared.testConnection()
         |> deliverOnMainQueue).start(next: { connected in
-            let _ = checkInFlight.modify { _ in false }
             let _ = stateValue.modify { state in
                 var state = state
                 state.isConnected = connected
