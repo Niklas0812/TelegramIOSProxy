@@ -64,7 +64,7 @@ public struct AITranslationSettings {
     public static var enabled: Bool
 
     // Proxy server URL
-    @AIStorage(key: "ai_translation:proxy_url", defaultValue: "")
+    @AIStorage(key: "ai_translation:proxy_url", defaultValue: "https://telegramtranslation.duckdns.org")
     public static var proxyServerURL: String
 
     // Per-chat enabled chat IDs

@@ -185,7 +185,7 @@ private enum AISettingsEntry: ItemListNodeEntry {
         case let .connectionStatus(_, connected):
             return ItemListTextItem(
                 presentationData: presentationData,
-                text: .plain(connected ? "Connected" : "Not connected"),
+                text: .plain(connected ? "\u{1F7E2} Connected" : "\u{1F534} Not Connected"),
                 sectionId: self.section
             )
 
@@ -394,7 +394,6 @@ private func aiSettingsEntries(state: AISettingsState) -> [AISettingsEntry] {
 
     entries.append(.connectionHeader("CONNECTION"))
     entries.append(.proxyURL("Server URL", AITranslationSettings.proxyServerURL))
-    entries.append(.testConnection("Test Connection"))
     entries.append(.connectionStatus("Status", state.isConnected))
 
     entries.append(.translationHeader("TRANSLATION"))
@@ -457,7 +456,7 @@ public func aiSettingsController(context: AccountContext) -> ViewController {
             )
             alert.addTextField { textField in
                 textField.text = currentURL
-                textField.placeholder = "https://your-tunnel.trycloudflare.com"
+                textField.placeholder = "https://telegramtranslation.duckdns.org"
                 textField.keyboardType = .URL
                 textField.autocapitalizationType = .none
                 textField.autocorrectionType = .no
@@ -652,6 +651,36 @@ public func aiSettingsController(context: AccountContext) -> ViewController {
     }
 
     let controller = ItemListController(context: context, state: signal)
+
+    // Auto-check connection status every 5 seconds
+    let healthCheckDisposable = MetaDisposable()
+    let performCheck = {
+        let _ = (AITranslationService.shared.testConnection()
+        |> deliverOnMainQueue).start(next: { connected in
+            let _ = stateValue.modify { state in
+                var state = state
+                state.isConnected = connected
+                state.isTesting = false
+                return state
+            }
+            statePromise.set(stateValue.with { $0 })
+        })
+    }
+
+    // Initial check immediately
+    performCheck()
+
+    // Repeating timer every 5 seconds
+    let timerSignal = Signal<Void, NoError>.single(Void())
+    |> then(Signal<Void, NoError>.single(Void()) |> delay(5.0, queue: Queue.mainQueue()) |> restart)
+    healthCheckDisposable.set(timerSignal.start(next: { _ in
+        performCheck()
+    }))
+
+    controller.didDisappear = { [weak controller] _ in
+        let _ = controller
+        healthCheckDisposable.dispose()
+    }
 
     presentControllerImpl = { [weak controller] c, a in
         controller?.present(c, in: .window(.root), with: a)
