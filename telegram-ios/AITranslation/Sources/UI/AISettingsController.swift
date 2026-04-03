@@ -653,33 +653,44 @@ public func aiSettingsController(context: AccountContext) -> ViewController {
     let controller = ItemListController(context: context, state: signal)
 
     // Auto-check connection status every 5 seconds
-    let healthCheckDisposable = MetaDisposable()
+    let currentCheckDisposable = MetaDisposable()
+    let checkInFlight = Atomic<Bool>(value: false)
+
     let performCheck = {
-        let _ = (AITranslationService.shared.testConnection()
+        // Skip if a check is already in flight (prevents pileup on slow connections)
+        guard checkInFlight.with({ !$0 }) else { return }
+        let _ = checkInFlight.modify { _ in true }
+
+        currentCheckDisposable.set((AITranslationService.shared.testConnection()
         |> deliverOnMainQueue).start(next: { connected in
+            let _ = checkInFlight.modify { _ in false }
             let _ = stateValue.modify { state in
                 var state = state
                 state.isConnected = connected
-                state.isTesting = false
                 return state
             }
             statePromise.set(stateValue.with { $0 })
-        })
+        }))
     }
 
     // Initial check immediately
     performCheck()
 
     // Repeating timer every 5 seconds
-    let timerSignal = Signal<Void, NoError>.single(Void())
-    |> then(Signal<Void, NoError>.single(Void()) |> delay(5.0, queue: Queue.mainQueue()) |> restart)
-    healthCheckDisposable.set(timerSignal.start(next: { _ in
+    let timerDisposable = MetaDisposable()
+    timerDisposable.set((Signal<Void, NoError>.single(Void())
+    |> delay(5.0, queue: Queue.mainQueue())
+    |> restart).start(next: { _ in
         performCheck()
     }))
 
-    controller.didDisappear = { [weak controller] _ in
-        let _ = controller
-        healthCheckDisposable.dispose()
+    // Clean up when controller is popped (not just when pushing a child)
+    controller.didDisappear = { [weak controller] animated in
+        // Only dispose if we're actually being removed, not just pushing a child
+        if controller?.navigationController == nil {
+            timerDisposable.dispose()
+            currentCheckDisposable.dispose()
+        }
     }
 
     presentControllerImpl = { [weak controller] c, a in
