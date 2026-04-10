@@ -108,7 +108,7 @@ def patch_chat_controller(filepath: str) -> None:
                             AIBackgroundTranslationObserver.pendingCaptionOriginals["\\(aiPeerId.id._internalGetInt64Value())_\\(translatedText)"] = aiCaptionText
                             let _ = enqueueMessages(account: self.context.account, peerId: aiPeerId, messages: newMessages).start()
                         } else {
-                            // Translation failed — do NOT send untranslated. Show error.
+                            AILogger.log("POPUP SHOWN: caption fail — result=\\(result == nil ? "nil" : "empty")")
                             self.present(UndoOverlayController(
                                 presentationData: self.presentationData,
                                 content: .info(title: nil, text: "Translation failed. Message not sent. Try again.", timeout: 5.0, customUndoText: nil),
@@ -118,12 +118,12 @@ def patch_chat_controller(filepath: str) -> None:
                         }
                     }))
 
-                    // 30-second failsafe timeout
+                    // Failsafe timeout
                     DispatchQueue.main.asyncAfter(deadline: .now() + 60.0) { [weak self] in
                         guard !aiTranslationCompleted, let self = self else { return }
                         aiTranslationCompleted = true
                         aiTranslationDisposable.dispose()
-                        // Do NOT send untranslated. Show error.
+                        AILogger.log("POPUP SHOWN: caption 60s TIMEOUT")
                         self.present(UndoOverlayController(
                             presentationData: self.presentationData,
                             content: .info(title: nil, text: "Translation timed out. Message not sent. Try again.", timeout: 5.0, customUndoText: nil),

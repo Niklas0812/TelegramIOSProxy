@@ -159,10 +159,20 @@ else
     echo "    Done."
 fi
 
+# 13a. Add AITranslation dep to ChatListUI BUILD — needed by ChatListItemStrings.swift
+echo "  [13a/17] Adding AITranslation dep to ChatListUI BUILD..."
+CHAT_LIST_UI_BUILD="${TARGET_DIR}/submodules/ChatListUI/BUILD"
+if grep -q "AITranslation" "$CHAT_LIST_UI_BUILD" 2>/dev/null; then
+    echo "    Already present, skipping."
+else
+    insert_after "$CHAT_LIST_UI_BUILD" "deps = [" '        "//submodules/AITranslation:AITranslation",'
+    echo "    Done."
+fi
+
 # 13. Patch ChatListItemStrings.swift for translated chat list preview
 echo "  [13/17] Patching ChatListItemStrings.swift..."
 CHAT_LIST_STRINGS="${TARGET_DIR}/submodules/ChatListUI/Sources/Node/ChatListItemStrings.swift"
-if grep -q "TranslationMessageAttribute" "$CHAT_LIST_STRINGS" 2>/dev/null; then
+if grep -q "AI Translation: quick reply cache fallback" "$CHAT_LIST_STRINGS" 2>/dev/null; then
     echo "    Already patched, skipping."
 else
     python3 "${SCRIPT_DIR}/patch_chat_list_strings.py" "$CHAT_LIST_STRINGS"

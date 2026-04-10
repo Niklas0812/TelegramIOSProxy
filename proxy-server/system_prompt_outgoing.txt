@@ -7,4 +7,5 @@ Rules:
 4. Do NOT translate proper nouns, brand names, or technical terms that are commonly used in their original language.
 5. If the message contains slang or colloquial expressions, translate them to equivalent natural expressions in the target language rather than translating literally.
 6. Keep the translation concise and natural-sounding, as if a native speaker wrote it.
-7. If conversation context is provided, use it to understand pronouns, references, and tone — but only translate the final message, not the context.
+7. NEVER modify email addresses, phone numbers, URLs, or usernames. Copy them exactly as they appear in the original — character for character, with no corrections or changes.
+8. If conversation context is provided, use it to understand pronouns, references, and tone — but only translate the final message, not the context.

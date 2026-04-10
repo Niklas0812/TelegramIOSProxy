@@ -40,6 +40,25 @@ public final class AIBackgroundTranslationObserver {
     /// gets stripped during the media send pipeline.
     public static var pendingCaptionOriginals: [String: String] = [:]
 
+    /// Cache of translated quick reply template messages.
+    /// Key: template MessageId (from Postbox).
+    /// Value: English translation of the German template text.
+    ///
+    /// Populated in the background by `translateQuickReplyTemplates()` and read by:
+    /// - `patch_chat_list_strings.py` (to display English in the "/" dropdown preview rows,
+    ///    which use ChatListItem → ChatListItemStrings)
+    /// - `patch_quick_reply.py` (to attach TranslationMessageAttribute to the outgoing message
+    ///    so the sent message bubble renders in English locally)
+    ///
+    /// We use a separate dict instead of attaching TranslationMessageAttribute directly to
+    /// the template messages in Postbox, because shortcut sync from the server may wipe
+    /// locally-attached attributes.
+    public static var quickReplyTranslations: [MessageId: String] = [:]
+
+    /// Set of shortcut IDs whose messages are currently being translated, to prevent
+    /// duplicate work when the scanner runs again while a previous scan is still in flight.
+    private static var quickReplyInFlight = Set<Int32>()
+
     /// Call when an authorized account is available. Handles account switches
     /// by tearing down the old observer and creating a new one for the new account.
     public static func startIfNeeded(context: AccountContext) {
@@ -69,6 +88,10 @@ public final class AIBackgroundTranslationObserver {
         // Catch-up: translate recent messages across top chats on the new account.
         // Handles messages that arrived while the user was on a different account.
         Self.catchUpAllUnreadChats(context: context)
+
+        // Pre-translate quick reply templates (stored in German) so the "/" dropdown
+        // preview and sent-message display show English locally.
+        Self.translateQuickReplyTemplates(context: context)
     }
 
     // MARK: - Primary: Translate by Message IDs (from AccountStateManager callback)
@@ -286,6 +309,91 @@ public final class AIBackgroundTranslationObserver {
                 }
             )
         })
+    }
+
+    // MARK: - Quick Reply Template Translation
+
+    /// Scan all of the user's quick reply shortcut templates (stored in German on the account)
+    /// and translate each template message DE → EN. Results are stored in
+    /// `quickReplyTranslations[msgId]` for use by the "/" preview UI and the send interceptor.
+    ///
+    /// Safe to call repeatedly — already-translated messages and in-flight shortcuts are skipped.
+    /// Designed to be cheap on subsequent calls.
+    public static func translateQuickReplyTemplates(context: AccountContext) {
+        guard AITranslationSettings.enabled else { return }
+        guard let _ = storedContext else { return }
+
+        AILogger.log("QR-SCAN: starting quick reply template translation scan")
+
+        let _ = (context.engine.accountData.shortcutMessageList(onlyRemote: false)
+        |> take(1)
+        |> deliverOnMainQueue).start(next: { list in
+            guard !list.items.isEmpty else {
+                AILogger.log("QR-SCAN: no shortcuts found")
+                return
+            }
+            AILogger.log("QR-SCAN: found \(list.items.count) shortcut(s)")
+
+            for item in list.items {
+                guard let shortcutId = item.id else { continue }
+                // Skip if already scanning this shortcut
+                if Self.quickReplyInFlight.contains(shortcutId) { continue }
+                Self.quickReplyInFlight.insert(shortcutId)
+
+                let _ = (context.account.viewTracker.quickReplyMessagesViewForLocation(quickReplyId: shortcutId)
+                |> take(1)
+                |> deliverOnMainQueue).start(next: { view, _, _ in
+                    Self.processQuickReplyMessages(view: view, shortcutId: shortcutId, context: context)
+                }, completed: {
+                    // Safety: clear in-flight flag even if no value was emitted
+                    Self.quickReplyInFlight.remove(shortcutId)
+                })
+            }
+        })
+    }
+
+    /// Translate every text-bearing message in a shortcut view that isn't already cached.
+    private static func processQuickReplyMessages(
+        view: MessageHistoryView,
+        shortcutId: Int32,
+        context: AccountContext
+    ) {
+        var toTranslate: [(MessageId, String)] = []
+        for entry in view.entries {
+            let msg = entry.message
+            guard !msg.text.isEmpty else { continue }
+            // Skip already-cached and already-in-flight messages
+            if Self.quickReplyTranslations[msg.id] != nil { continue }
+            if Self.inFlightMessageIds.contains(msg.id) { continue }
+            Self.inFlightMessageIds.insert(msg.id)
+            toTranslate.append((msg.id, msg.text))
+        }
+
+        guard !toTranslate.isEmpty else {
+            AILogger.log("QR-SCAN: shortcut \(shortcutId) — all \(view.entries.count) messages already cached/in-flight")
+            return
+        }
+
+        AILogger.log("QR-SCAN: shortcut \(shortcutId) — translating \(toTranslate.count) template(s)")
+
+        for (msgId, text) in toTranslate {
+            let textPreview = String(text.prefix(40))
+            let _ = (AITranslationService.shared.translateIncomingStrict(
+                text: text,
+                chatId: msgId.peerId,
+                context: []
+            )
+            |> deliverOnMainQueue).start(next: { translatedText in
+                if let translatedText = translatedText, !translatedText.isEmpty {
+                    Self.quickReplyTranslations[msgId] = translatedText
+                    AILogger.log("QR-SCAN OK: shortcut \(shortcutId) msg=\(msgId.id) '\(textPreview)' -> '\(String(translatedText.prefix(40)))'")
+                } else {
+                    AILogger.log("QR-SCAN FAIL: shortcut \(shortcutId) msg=\(msgId.id) text='\(textPreview)'")
+                }
+            }, completed: {
+                Self.inFlightMessageIds.remove(msgId)
+            })
+        }
     }
 
     // MARK: - Account Switch Catch-Up

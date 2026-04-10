@@ -29,3 +29,13 @@ build/
 
 # Telegram-iOS clone (created by setup script)
 telegram-ios-build/
+
+# Certificates and keys (NEVER commit)
+*.p12
+*.key
+*.csr
+*.pem
+*.mobileprovision
+
+# OTA IPA files (too large for git)
+proxy-server/ota/*.ipa

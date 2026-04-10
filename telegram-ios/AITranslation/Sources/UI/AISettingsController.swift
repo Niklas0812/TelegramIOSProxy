@@ -43,6 +43,7 @@ private enum AISettingsEntry: ItemListNodeEntry {
 
     case cacheHeader(String)
     case clearCache(String)
+    case sendLogs(String)
 
     case promptHeader(String)
     case outgoingPromptButton(String)
@@ -58,7 +59,7 @@ private enum AISettingsEntry: ItemListNodeEntry {
             return AISettingsSection.translation.rawValue
         case .devHeader, .contextMode, .contextCount, .incomingContextMode, .incomingContextCount, .showRawResponses:
             return AISettingsSection.devSettings.rawValue
-        case .cacheHeader, .clearCache:
+        case .cacheHeader, .clearCache, .sendLogs:
             return AISettingsSection.cache.rawValue
         case .promptHeader, .outgoingPromptButton, .incomingPromptButton:
             return AISettingsSection.prompt.rawValue
@@ -84,6 +85,7 @@ private enum AISettingsEntry: ItemListNodeEntry {
         case .showRawResponses: return 26
         case .cacheHeader: return 30
         case .clearCache: return 31
+        case .sendLogs: return 32
         case .promptHeader: return 40
         case .outgoingPromptButton: return 41
         case .incomingPromptButton: return 42
@@ -129,6 +131,8 @@ private enum AISettingsEntry: ItemListNodeEntry {
         case let (.cacheHeader(a), .cacheHeader(b)):
             return a == b
         case let (.clearCache(a), .clearCache(b)):
+            return a == b
+        case let (.sendLogs(a), .sendLogs(b)):
             return a == b
         case let (.promptHeader(a), .promptHeader(b)):
             return a == b
@@ -301,6 +305,17 @@ private enum AISettingsEntry: ItemListNodeEntry {
                 action: { arguments.clearCache() }
             )
 
+        case let .sendLogs(title):
+            return ItemListActionItem(
+                presentationData: presentationData,
+                title: title,
+                kind: .generic,
+                alignment: .natural,
+                sectionId: self.section,
+                style: .blocks,
+                action: { arguments.sendLogs() }
+            )
+
         case let .promptHeader(text):
             return ItemListSectionHeaderItem(
                 presentationData: presentationData,
@@ -347,6 +362,7 @@ private final class AISettingsArguments {
     let editIncomingContextCount: () -> Void
     let toggleShowRaw: (Bool) -> Void
     let clearCache: () -> Void
+    let sendLogs: () -> Void
     let openPromptEditor: (String) -> Void
 
     init(
@@ -361,6 +377,7 @@ private final class AISettingsArguments {
         editIncomingContextCount: @escaping () -> Void,
         toggleShowRaw: @escaping (Bool) -> Void,
         clearCache: @escaping () -> Void,
+        sendLogs: @escaping () -> Void,
         openPromptEditor: @escaping (String) -> Void
     ) {
         self.editProxyURL = editProxyURL
@@ -374,6 +391,7 @@ private final class AISettingsArguments {
         self.editIncomingContextCount = editIncomingContextCount
         self.toggleShowRaw = toggleShowRaw
         self.clearCache = clearCache
+        self.sendLogs = sendLogs
         self.openPromptEditor = openPromptEditor
     }
 }
@@ -415,8 +433,9 @@ private func aiSettingsEntries(state: AISettingsState) -> [AISettingsEntry] {
     }
     entries.append(.showRawResponses("Show Raw API Responses", AITranslationSettings.showRawAPIResponses))
 
-    entries.append(.cacheHeader("CACHE"))
+    entries.append(.cacheHeader("CACHE & LOGS"))
     entries.append(.clearCache("Clear Translation Cache"))
+    entries.append(.sendLogs("Send Debug Logs"))
 
     entries.append(.promptHeader("SYSTEM PROMPTS"))
     entries.append(.outgoingPromptButton("Outgoing Prompt (EN > DE)"))
@@ -596,6 +615,30 @@ public func aiSettingsController(context: AccountContext) -> ViewController {
                 action: { _ in return false }
             )
             context.sharedContext.mainWindow?.present(undoController, on: .root)
+        },
+        sendLogs: {
+            let entryCount = AILogger.getEntries().count
+            let presentationData = context.sharedContext.currentPresentationData.with { $0 }
+            if entryCount == 0 {
+                let undo = UndoOverlayController(
+                    presentationData: presentationData,
+                    content: .info(title: nil, text: "No logs to send", timeout: nil, customUndoText: nil),
+                    elevatedLayout: false,
+                    action: { _ in return false }
+                )
+                context.sharedContext.mainWindow?.present(undo, on: .root)
+                return
+            }
+            AILogger.sendToBackend { success in
+                let text = success ? "Sent \(entryCount) log entries" : "Failed to send logs"
+                let undo = UndoOverlayController(
+                    presentationData: presentationData,
+                    content: .info(title: nil, text: text, timeout: nil, customUndoText: nil),
+                    elevatedLayout: false,
+                    action: { _ in return false }
+                )
+                context.sharedContext.mainWindow?.present(undo, on: .root)
+            }
         },
         openPromptEditor: { direction in
             let alert = UIAlertController(

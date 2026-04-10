@@ -62,6 +62,7 @@ def patch_load_display_node(filepath: str) -> None:
 {indent}    }}
 {indent}    return false
 {indent}}})
+{indent}AILogger.log("PATCH: aiNeedsTranslation=\\(aiNeedsTranslation) msgCount=\\(transformedMessages.count) peer=\\(peerId.id._internalGetInt64Value()) enabled=\\(AITranslationSettings.enabled) outgoing=\\(AITranslationSettings.autoTranslateOutgoing)")
 {indent}if aiNeedsTranslation {{
 {indent}    // Chronological queue with cascading failure.
 {indent}    // Forwards + text-free messages are batched together to preserve album grouping.
@@ -91,6 +92,7 @@ def patch_load_display_node(filepath: str) -> None:
 {indent}                    }},
 {indent}                    errorAction: {{ [weak strongSelf] in
 {indent}                        guard let strongSelf = strongSelf else {{ return }}
+{indent}                        AILogger.log("POPUP SHOWN: Translation failed (compose bar)")
 {indent}                        strongSelf.present(UndoOverlayController(
 {indent}                            presentationData: strongSelf.presentationData,
 {indent}                            content: .info(title: nil, text: "Translation failed. Message not sent. Try again.", timeout: 5.0, customUndoText: nil),

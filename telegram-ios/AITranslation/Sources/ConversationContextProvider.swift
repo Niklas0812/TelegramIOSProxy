@@ -31,7 +31,10 @@ public final class ConversationContextProvider {
             return .single([])
         }
 
+        AILogger.log("CTX: Postbox transaction START chat=\(chatId.id._internalGetInt64Value()) limit=\(messageCount)")
+        let startTime = CFAbsoluteTimeGetCurrent()
         return context.account.postbox.transaction { transaction -> [AIContextMessage] in
+            let elapsed = Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
             let accountPeerId = context.account.peerId
 
             // Read recent messages from the chat using scanTopMessages
@@ -60,6 +63,7 @@ public final class ConversationContextProvider {
                 contextMessages.append(AIContextMessage(role: role, text: text))
             }
 
+            AILogger.log("CTX: Postbox transaction DONE chat=\(chatId.id._internalGetInt64Value()) msgs=\(contextMessages.count) waitMs=\(elapsed)")
             return contextMessages
         }
     }

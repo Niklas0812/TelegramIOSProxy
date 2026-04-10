@@ -125,7 +125,7 @@ public final class AIProxyClient {
     private let session: URLSession
     private let outgoingSession: URLSession
     private let batchSession: URLSession
-    private let baseURL: String
+    public let baseURL: String
 
     public init(baseURL: String) {
         let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -302,6 +302,7 @@ public final class AIProxyClient {
         context: [AIContextMessage]
     ) -> Signal<StrictTranslationResult, NoError> {
         guard let url = URL(string: "\(baseURL)/translate") else {
+            AILogger.log("HTTP E0: invalid URL — baseURL='\(baseURL)'")
             return .single(.iosError)
         }
 
@@ -325,29 +326,48 @@ public final class AIProxyClient {
                 return EmptyDisposable
             }
 
+            let textPreview = String(request.text.prefix(40))
+            let httpStart = CFAbsoluteTimeGetCurrent()
+            AILogger.log("HTTP REQ-START: \(direction) text='\(textPreview)' url=\(url.absoluteString)")
             let task = self.outgoingSession.dataTask(with: urlRequest) { data, response, error in
+                let httpMs = Int((CFAbsoluteTimeGetCurrent() - httpStart) * 1000)
+                let httpStatus = (response as? HTTPURLResponse)?.statusCode ?? -1
+
                 if let error = error {
+                    let nsErr = error as NSError
+                    AILogger.log("HTTP ERR-NET: \(httpMs)ms status=\(httpStatus) domain=\(nsErr.domain) code=\(nsErr.code) desc=\(nsErr.localizedDescription) text='\(textPreview)'")
                     subscriber.putNext(.iosError)
                     subscriber.putCompletion()
                     return
                 }
 
                 guard let data = data else {
+                    AILogger.log("HTTP ERR-NODATA: \(httpMs)ms status=\(httpStatus) text='\(textPreview)'")
                     subscriber.putNext(.iosError)
                     subscriber.putCompletion()
                     return
                 }
 
+                if httpStatus != 200 {
+                    let bodyPreview = String(data: data.prefix(200), encoding: .utf8) ?? "(binary)"
+                    AILogger.log("HTTP ERR-STATUS: \(httpMs)ms status=\(httpStatus) body=\(bodyPreview) text='\(textPreview)'")
+                }
+
                 do {
-                    let response = try JSONDecoder().decode(AITranslateResponse.self, from: data)
-                    if response.translationFailed {
+                    let resp = try JSONDecoder().decode(AITranslateResponse.self, from: data)
+                    if resp.translationFailed {
+                        AILogger.log("HTTP BACKEND-FAIL: \(httpMs)ms translation_failed=true text='\(textPreview)'")
                         subscriber.putNext(.backendFailure)
-                    } else if response.translatedText.isEmpty {
+                    } else if resp.translatedText.isEmpty {
+                        AILogger.log("HTTP EMPTY-RESULT: \(httpMs)ms translatedText='' text='\(textPreview)'")
                         subscriber.putNext(.iosError)
                     } else {
-                        subscriber.putNext(.success(response.translatedText))
+                        AILogger.log("HTTP OK: \(httpMs)ms status=\(httpStatus) text='\(textPreview)' -> '\(String(resp.translatedText.prefix(40)))'")
+                        subscriber.putNext(.success(resp.translatedText))
                     }
                 } catch {
+                    let bodyPreview = String(data: data.prefix(300), encoding: .utf8) ?? "(binary \(data.count)b)"
+                    AILogger.log("HTTP ERR-DECODE: \(httpMs)ms \(error) status=\(httpStatus) body=\(bodyPreview)")
                     subscriber.putNext(.iosError)
                 }
                 subscriber.putCompletion()

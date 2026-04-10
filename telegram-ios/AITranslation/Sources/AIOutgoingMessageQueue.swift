@@ -95,6 +95,7 @@ public final class AIOutgoingMessageQueue {
             peerQueues[peerId] = []
         }
         peerQueues[peerId]!.append(entry)
+        AILogger.log("QUEUE: enqueued entry \(entryId) peer=\(peerId.id._internalGetInt64Value()) text='\(String(text.prefix(40)))' queueSize=\(peerQueues[peerId]!.count)")
 
         // Fire translation IMMEDIATELY — zero delay
         let signal = AITranslationService.shared.translateOutgoingStrict(
@@ -108,13 +109,13 @@ public final class AIOutgoingMessageQueue {
             self?.handleTranslationResult(entryId: entryId, peerId: peerId, result: result)
         }))
 
-        // 30-second failsafe: if translation doesn't complete, auto-fail.
-        // Triggers error popup + text restore. No message may silently vanish.
+        // Failsafe timeout: if translation doesn't complete, auto-fail.
         DispatchQueue.main.asyncAfter(deadline: .now() + 60.0) { [weak self] in
             guard let self = self else { return }
             guard let queue = self.peerQueues[peerId],
                   let entry = queue.first(where: { $0.id == entryId }),
                   case .translating = entry.state else { return }
+            AILogger.log("QUEUE E8: 60s TIMEOUT entry=\(entryId) text='\(String(text.prefix(40)))'")
             entry.translationDisposable.dispose()
             entry.state = .failed
             self.drainQueue(peerId: peerId)
@@ -126,16 +127,21 @@ public final class AIOutgoingMessageQueue {
     private func handleTranslationResult(entryId: Int, peerId: PeerId, result: String?) {
         guard let queue = peerQueues[peerId],
               let entry = queue.first(where: { $0.id == entryId }) else {
+            AILogger.log("QUEUE: entry \(entryId) not found (queue cleared)")
             return
         }
 
-        // Don't update if already cancelled (cascade from earlier failure)
-        guard case .translating = entry.state else { return }
+        guard case .translating = entry.state else {
+            AILogger.log("QUEUE: entry \(entryId) not .translating, skip")
+            return
+        }
 
         if let translatedText = result, !translatedText.isEmpty {
             entry.state = .translated(translatedText)
+            AILogger.log("QUEUE: entry \(entryId) OK (\(translatedText.count) chars)")
         } else {
             entry.state = .failed
+            AILogger.log("QUEUE E7: entry \(entryId) FAILED — result=\(result == nil ? "nil" : "empty") text='\(String(entry.originalText.prefix(40)))'")
         }
 
         drainQueue(peerId: peerId)
@@ -155,7 +161,7 @@ public final class AIOutgoingMessageQueue {
                 continue
 
             case .translating:
-                // Still waiting — can't send anything after this
+                AILogger.log("QUEUE: drainQueue blocked — entry \(entry.id) still .translating, waiting...")
                 cleanupSentEntries(peerId: peerId)
                 return
 
@@ -163,9 +169,10 @@ public final class AIOutgoingMessageQueue {
                 // Ready to send — call the closure
                 if entry.sendAction(translatedText) {
                     entry.state = .sent
+                    AILogger.log("QUEUE: entry \(entry.id) SENT")
                     i += 1
                 } else {
-                    // Controller is gone — still try to show error and restore text
+                    AILogger.log("QUEUE E5: sendAction=false entry=\(entry.id) text='\(String(entry.originalText.prefix(40)))' — controller deallocated?")
                     entry.restoreAction(entry.originalText)
                     entry.errorAction()
                     for j in (i + 1)..<queue.count {
@@ -177,7 +184,7 @@ public final class AIOutgoingMessageQueue {
                 }
 
             case .failed:
-                // CASCADE FAILURE: cancel all subsequent messages
+                AILogger.log("QUEUE E6: cascade fail entry=\(entry.id) text='\(String(entry.originalText.prefix(40)))'")
                 performCascadeFailure(peerId: peerId, failedIndex: i)
                 return
             }

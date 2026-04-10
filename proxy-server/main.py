@@ -639,6 +639,33 @@ async def root():
     return {"status": "ok"}
 
 
+IOS_DEBUG_LOG = Path(__file__).parent / "ios_debug.log"
+
+
+@app.post("/logs")
+async def receive_ios_logs(request: Request):
+    """Receive debug logs from the iOS app and save to ios_debug.log."""
+    try:
+        body = await request.json()
+        entries = body.get("entries", [])
+        device = body.get("device", "unknown")
+        sent_at = body.get("sent_at", "")
+
+        with open(IOS_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n===== iOS Logs from '{device}' at {sent_at} ({len(entries)} entries) =====\n")
+            for entry in entries:
+                ts = entry.get("ts", "?")
+                msg = entry.get("msg", "")
+                f.write(f"  [{ts}] {msg}\n")
+            f.write(f"===== END =====\n")
+
+        logger.info(f"Received {len(entries)} iOS debug log entries from '{device}'")
+        return {"status": "ok", "received": len(entries)}
+    except Exception as e:
+        logger.error(f"Failed to process iOS logs: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 @app.get("/stats")
 async def stats():
     s = translation_service.stats

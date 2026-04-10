@@ -11,6 +11,9 @@ public final class AITranslationService {
     private var proxyClient: AIProxyClient?
 
     private init() {
+        // Trigger AILogger lifecycle observer setup
+        _ = AILogger.shared
+        AILogger.log("AITranslationService INIT — url='\(AITranslationSettings.proxyServerURL)' enabled=\(AITranslationSettings.enabled) outgoing=\(AITranslationSettings.autoTranslateOutgoing) contextMode=\(AITranslationSettings.contextMode)")
         updateProxyClient()
     }
 
@@ -74,18 +77,25 @@ public final class AITranslationService {
         chatId: PeerId,
         context: AccountContext
     ) -> Signal<String?, NoError> {
+        let chatIdInt = chatId.id._internalGetInt64Value()
+        let textPreview = String(text.prefix(40))
+
         guard shouldTranslateOutgoing(chatId: chatId) else {
+            AILogger.log("OUT SKIP: shouldTranslate=false chat=\(chatIdInt) — returning original")
             return .single(text)
         }
         if proxyClient == nil {
+            AILogger.log("OUT: proxyClient nil, calling updateProxyClient()")
             updateProxyClient()
         }
         guard let client = proxyClient else {
+            AILogger.log("OUT E1: proxyClient STILL nil — url='\(AITranslationSettings.proxyServerURL)'")
             return .single(nil)
         }
 
         let contextSignal: Signal<[AIContextMessage], NoError>
         if AITranslationSettings.contextMode == 2 {
+            AILogger.log("OUT: fetching context (mode=2) chat=\(chatIdInt)")
             contextSignal = ConversationContextProvider.getContext(
                 chatId: chatId,
                 context: context
@@ -94,10 +104,11 @@ public final class AITranslationService {
             contextSignal = .single([])
         }
 
-        let chatIdInt = chatId.id._internalGetInt64Value()
+        AILogger.log("OUT START: chat=\(chatIdInt) text='\(textPreview)' url=\(client.baseURL)")
 
         return contextSignal
         |> mapToSignal { contextMessages -> Signal<String?, NoError> in
+            AILogger.log("OUT: context ready (\(contextMessages.count) msgs), firing HTTP...")
             return client.translateStrictDetailed(
                 text: text,
                 direction: "outgoing",
@@ -107,15 +118,18 @@ public final class AITranslationService {
             |> mapToSignal { result -> Signal<String?, NoError> in
                 switch result {
                 case .success(let translatedText):
+                    AILogger.log("OUT OK: '\(textPreview)' -> '\(String(translatedText.prefix(40)))'")
                     return .single(translatedText)
                 case .backendFailure:
-                    // Backend already retried 3x and gave up — no iOS retry
+                    AILogger.log("OUT E2: backendFailure (translation_failed=true) text='\(textPreview)'")
                     return .single(nil)
                 case .iosError:
-                    // iOS-side error (network/decode/empty) — recreate client with fresh
-                    // URLSession (stale HTTP connections cause instant failures) then retry once
+                    AILogger.log("OUT: iosError on 1st attempt, retrying with fresh client...")
                     self.updateProxyClient()
-                    guard let freshClient = self.proxyClient else { return .single(nil) }
+                    guard let freshClient = self.proxyClient else {
+                        AILogger.log("OUT E3: freshClient nil after update — url='\(AITranslationSettings.proxyServerURL)'")
+                        return .single(nil)
+                    }
                     return freshClient.translateStrictDetailed(
                         text: text,
                         direction: "outgoing",
@@ -124,8 +138,10 @@ public final class AITranslationService {
                     )
                     |> map { retryResult -> String? in
                         if case .success(let retryText) = retryResult {
+                            AILogger.log("OUT OK(retry): '\(textPreview)' -> '\(String(retryText.prefix(40)))'")
                             return retryText
                         }
+                        AILogger.log("OUT E4: retry failed text='\(textPreview)' result=\(retryResult)")
                         return nil
                     }
                 }
