@@ -321,8 +321,9 @@ public final class AITranslationService {
             switch result {
             case .success(let translatedText):
                 return .single(translatedText)
-            case .backendFailure:
+            case .backendFailure, .userClaimed:
                 // Backend already retried 3x and gave up — no iOS retry
+                // userClaimed doesn't apply to incoming, but handle for exhaustive switch
                 return .single(nil)
             case .iosError:
                 // iOS-side error — recreate client with fresh URLSession then retry once
