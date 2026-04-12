@@ -10,6 +10,17 @@ public final class AITranslationService {
     private let cache = TranslationCache()
     private var proxyClient: AIProxyClient?
 
+    // MARK: - Global Connection Status
+
+    /// Observable current connection status. UI subscribes to this for live updates.
+    /// The value is kept fresh by `startConnectionMonitor()` which runs a 5-second
+    /// health check loop independently of any UI controller.
+    public let isConnectedPromise = ValuePromise<Bool>(false, ignoreRepeated: true)
+
+    private let connectionMonitorDisposable = MetaDisposable()
+    private let connectionCheckDisposable = MetaDisposable()
+    private var connectionMonitorStarted = false
+
     private init() {
         // Trigger AILogger lifecycle observer setup
         _ = AILogger.shared
@@ -25,6 +36,54 @@ public final class AITranslationService {
             return
         }
         proxyClient = AIProxyClient(baseURL: url)
+    }
+
+    // MARK: - Connection Monitor
+
+    /// Start the global 5-second health check loop. Safe to call multiple times —
+    /// only the first call has effect. Idempotent.
+    ///
+    /// Runs at the singleton level so the connection status is always current,
+    /// regardless of which Telegram tab is active. UI controllers subscribe to
+    /// `isConnectedPromise` to display the result.
+    public func startConnectionMonitor() {
+        guard !connectionMonitorStarted else { return }
+        connectionMonitorStarted = true
+
+        AILogger.log("CONN-MONITOR: starting global 5s health check loop")
+
+        let performCheck: () -> Void = { [weak self] in
+            guard let self = self else { return }
+            // MetaDisposable.set() cancels any previous in-flight check automatically.
+            // If the server is hanging, the old request is cancelled and a fresh one starts.
+            self.connectionCheckDisposable.set((self.testConnection()
+            |> deliverOnMainQueue).start(next: { connected in
+                self.isConnectedPromise.set(connected)
+            }))
+        }
+
+        // Initial check immediately
+        performCheck()
+
+        // Repeating timer every 5 seconds
+        connectionMonitorDisposable.set((Signal<Void, NoError>.single(Void())
+        |> delay(5.0, queue: Queue.mainQueue())
+        |> restart).start(next: { _ in
+            performCheck()
+        }))
+    }
+
+    /// Force an immediate connection check. Used after the user saves a new proxy URL
+    /// so the status updates instantly instead of waiting up to 5 seconds for the next tick.
+    public func refreshConnectionStatus() {
+        guard connectionMonitorStarted else {
+            startConnectionMonitor()
+            return
+        }
+        connectionCheckDisposable.set((self.testConnection()
+        |> deliverOnMainQueue).start(next: { [weak self] connected in
+            self?.isConnectedPromise.set(connected)
+        }))
     }
 
     // MARK: - Outgoing Translation (EN → DE)
@@ -66,23 +125,34 @@ public final class AITranslationService {
     }
 
     /// Strict outgoing translation — returns nil on ANY failure.
+    // MARK: - Outgoing Translation Result
+
+    public enum OutgoingTranslationResult {
+        case success(String)         // Translated text — send it
+        case passthrough(String)     // shouldTranslateOutgoing=false — send original
+        case translationFailed       // Generic failure — show "Translation failed" popup
+        case userClaimed             // Target user claimed by another account
+    }
+
     /// Used by the outgoing queue to hard-block untranslated messages.
     ///
     /// Two-layer retry:
     /// 1. Backend retries 3x on its side (all error types).
     /// 2. If backend returns explicit failure flag → nil immediately (no iOS retry).
     /// 3. If iOS-side error (network/decode/empty) → iOS retries ONCE more.
+    /// 4. If backend returns user_claimed=true → immediate .userClaimed (no retry).
     public func translateOutgoingStrict(
         text: String,
         chatId: PeerId,
         context: AccountContext
-    ) -> Signal<String?, NoError> {
+    ) -> Signal<OutgoingTranslationResult, NoError> {
         let chatIdInt = chatId.id._internalGetInt64Value()
+        let senderAccountId = context.account.peerId.id._internalGetInt64Value()
         let textPreview = String(text.prefix(40))
 
         guard shouldTranslateOutgoing(chatId: chatId) else {
             AILogger.log("OUT SKIP: shouldTranslate=false chat=\(chatIdInt) — returning original")
-            return .single(text)
+            return .single(.passthrough(text))
         }
         if proxyClient == nil {
             AILogger.log("OUT: proxyClient nil, calling updateProxyClient()")
@@ -90,7 +160,7 @@ public final class AITranslationService {
         }
         guard let client = proxyClient else {
             AILogger.log("OUT E1: proxyClient STILL nil — url='\(AITranslationSettings.proxyServerURL)'")
-            return .single(nil)
+            return .single(.translationFailed)
         }
 
         let contextSignal: Signal<[AIContextMessage], NoError>
@@ -104,45 +174,55 @@ public final class AITranslationService {
             contextSignal = .single([])
         }
 
-        AILogger.log("OUT START: chat=\(chatIdInt) text='\(textPreview)' url=\(client.baseURL)")
+        AILogger.log("OUT START: chat=\(chatIdInt) sender=\(senderAccountId) text='\(textPreview)'")
 
         return contextSignal
-        |> mapToSignal { contextMessages -> Signal<String?, NoError> in
+        |> mapToSignal { contextMessages -> Signal<OutgoingTranslationResult, NoError> in
             AILogger.log("OUT: context ready (\(contextMessages.count) msgs), firing HTTP...")
             return client.translateStrictDetailed(
                 text: text,
                 direction: "outgoing",
                 chatId: chatIdInt,
+                senderAccountId: senderAccountId,
                 context: contextMessages
             )
-            |> mapToSignal { result -> Signal<String?, NoError> in
+            |> mapToSignal { result -> Signal<OutgoingTranslationResult, NoError> in
                 switch result {
                 case .success(let translatedText):
                     AILogger.log("OUT OK: '\(textPreview)' -> '\(String(translatedText.prefix(40)))'")
-                    return .single(translatedText)
+                    return .single(.success(translatedText))
+                case .userClaimed:
+                    AILogger.log("OUT CLAIMED: target=\(chatIdInt) sender=\(senderAccountId)")
+                    return .single(.userClaimed)
                 case .backendFailure:
-                    AILogger.log("OUT E2: backendFailure (translation_failed=true) text='\(textPreview)'")
-                    return .single(nil)
+                    AILogger.log("OUT E2: backendFailure text='\(textPreview)'")
+                    return .single(.translationFailed)
                 case .iosError:
                     AILogger.log("OUT: iosError on 1st attempt, retrying with fresh client...")
                     self.updateProxyClient()
                     guard let freshClient = self.proxyClient else {
-                        AILogger.log("OUT E3: freshClient nil after update — url='\(AITranslationSettings.proxyServerURL)'")
-                        return .single(nil)
+                        AILogger.log("OUT E3: freshClient nil after update")
+                        return .single(.translationFailed)
                     }
                     return freshClient.translateStrictDetailed(
                         text: text,
                         direction: "outgoing",
                         chatId: chatIdInt,
+                        senderAccountId: senderAccountId,
                         context: contextMessages
                     )
-                    |> map { retryResult -> String? in
-                        if case .success(let retryText) = retryResult {
+                    |> map { retryResult -> OutgoingTranslationResult in
+                        switch retryResult {
+                        case .success(let retryText):
                             AILogger.log("OUT OK(retry): '\(textPreview)' -> '\(String(retryText.prefix(40)))'")
-                            return retryText
+                            return .success(retryText)
+                        case .userClaimed:
+                            AILogger.log("OUT CLAIMED(retry): target=\(chatIdInt)")
+                            return .userClaimed
+                        default:
+                            AILogger.log("OUT E4: retry failed text='\(textPreview)'")
+                            return .translationFailed
                         }
-                        AILogger.log("OUT E4: retry failed text='\(textPreview)' result=\(retryResult)")
-                        return nil
                     }
                 }
             }

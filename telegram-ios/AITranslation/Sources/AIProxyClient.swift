@@ -7,19 +7,22 @@ public struct AITranslateRequest: Codable {
     public let text: String
     public let direction: String
     public let chatId: String
+    public let senderAccountId: String
     public let context: [AIContextMessage]
 
     enum CodingKeys: String, CodingKey {
         case text
         case direction
         case chatId = "chat_id"
+        case senderAccountId = "sender_account_id"
         case context
     }
 
-    public init(text: String, direction: String, chatId: String, context: [AIContextMessage]) {
+    public init(text: String, direction: String, chatId: String, senderAccountId: String = "", context: [AIContextMessage]) {
         self.text = text
         self.direction = direction
         self.chatId = chatId
+        self.senderAccountId = senderAccountId
         self.context = context
     }
 }
@@ -39,12 +42,26 @@ public struct AITranslateResponse: Codable {
     public let originalText: String
     public let direction: String
     public let translationFailed: Bool
+    public let userClaimed: Bool
+    public let claimedBy: String
 
     enum CodingKeys: String, CodingKey {
         case translatedText = "translated_text"
         case originalText = "original_text"
         case direction
         case translationFailed = "translation_failed"
+        case userClaimed = "user_claimed"
+        case claimedBy = "claimed_by"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        translatedText = try container.decode(String.self, forKey: .translatedText)
+        originalText = try container.decode(String.self, forKey: .originalText)
+        direction = try container.decode(String.self, forKey: .direction)
+        translationFailed = try container.decodeIfPresent(Bool.self, forKey: .translationFailed) ?? false
+        userClaimed = try container.decodeIfPresent(Bool.self, forKey: .userClaimed) ?? false
+        claimedBy = try container.decodeIfPresent(String.self, forKey: .claimedBy) ?? ""
     }
 }
 
@@ -117,6 +134,7 @@ public enum StrictTranslationResult {
     case success(String)       // Translated text
     case backendFailure        // translation_failed=true (backend already retried 3x)
     case iosError              // Network/decode/empty — iOS should retry once
+    case userClaimed           // Target user claimed by another account
 }
 
 // MARK: - Proxy Client
@@ -299,6 +317,7 @@ public final class AIProxyClient {
         text: String,
         direction: String,
         chatId: Int64,
+        senderAccountId: Int64 = 0,
         context: [AIContextMessage]
     ) -> Signal<StrictTranslationResult, NoError> {
         guard let url = URL(string: "\(baseURL)/translate") else {
@@ -310,6 +329,7 @@ public final class AIProxyClient {
             text: text,
             direction: direction,
             chatId: String(chatId),
+            senderAccountId: senderAccountId != 0 ? String(senderAccountId) : "",
             context: context
         )
 
@@ -355,7 +375,10 @@ public final class AIProxyClient {
 
                 do {
                     let resp = try JSONDecoder().decode(AITranslateResponse.self, from: data)
-                    if resp.translationFailed {
+                    if resp.userClaimed {
+                        AILogger.log("HTTP USER-CLAIMED: \(httpMs)ms target=\(request.chatId) claimed_by=\(resp.claimedBy) text='\(textPreview)'")
+                        subscriber.putNext(.userClaimed)
+                    } else if resp.translationFailed {
                         AILogger.log("HTTP BACKEND-FAIL: \(httpMs)ms translation_failed=true text='\(textPreview)'")
                         subscriber.putNext(.backendFailure)
                     } else if resp.translatedText.isEmpty {

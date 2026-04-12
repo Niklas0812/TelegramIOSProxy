@@ -18,6 +18,7 @@ public final class AIOutgoingMessageQueue {
         case translating
         case translated(String)
         case failed
+        case userClaimed
         case sent
         case cancelled
     }
@@ -31,15 +32,15 @@ public final class AIOutgoingMessageQueue {
         let sendAction: (String) -> Bool
         /// Restore original text to the input box.
         let restoreAction: (String) -> Void
-        /// Show error popup.
-        let errorAction: () -> Void
+        /// Show error popup with a specific message string.
+        let errorAction: (String) -> Void
 
         init(
             id: Int,
             originalText: String,
             sendAction: @escaping (String) -> Bool,
             restoreAction: @escaping (String) -> Void,
-            errorAction: @escaping () -> Void
+            errorAction: @escaping (String) -> Void
         ) {
             self.id = id
             self.originalText = originalText
@@ -78,7 +79,7 @@ public final class AIOutgoingMessageQueue {
         context: AccountContext,
         sendAction: @escaping (String) -> Bool,
         restoreAction: @escaping (String) -> Void,
-        errorAction: @escaping () -> Void
+        errorAction: @escaping (String) -> Void
     ) {
         let entryId = nextId
         nextId += 1
@@ -105,8 +106,8 @@ public final class AIOutgoingMessageQueue {
         )
         |> deliverOnMainQueue
 
-        entry.translationDisposable.set(signal.start(next: { [weak self] result in
-            self?.handleTranslationResult(entryId: entryId, peerId: peerId, result: result)
+        entry.translationDisposable.set(signal.start(next: { [weak self] outcome in
+            self?.handleTranslationResult(entryId: entryId, peerId: peerId, outcome: outcome)
         }))
 
         // Failsafe timeout: if translation doesn't complete, auto-fail.
@@ -124,7 +125,7 @@ public final class AIOutgoingMessageQueue {
 
     // MARK: - Private
 
-    private func handleTranslationResult(entryId: Int, peerId: PeerId, result: String?) {
+    private func handleTranslationResult(entryId: Int, peerId: PeerId, outcome: AITranslationService.OutgoingTranslationResult) {
         guard let queue = peerQueues[peerId],
               let entry = queue.first(where: { $0.id == entryId }) else {
             AILogger.log("QUEUE: entry \(entryId) not found (queue cleared)")
@@ -136,12 +137,16 @@ public final class AIOutgoingMessageQueue {
             return
         }
 
-        if let translatedText = result, !translatedText.isEmpty {
+        switch outcome {
+        case .success(let translatedText), .passthrough(let translatedText):
             entry.state = .translated(translatedText)
             AILogger.log("QUEUE: entry \(entryId) OK (\(translatedText.count) chars)")
-        } else {
+        case .translationFailed:
             entry.state = .failed
-            AILogger.log("QUEUE E7: entry \(entryId) FAILED — result=\(result == nil ? "nil" : "empty") text='\(String(entry.originalText.prefix(40)))'")
+            AILogger.log("QUEUE E7: entry \(entryId) FAILED text='\(String(entry.originalText.prefix(40)))'")
+        case .userClaimed:
+            entry.state = .userClaimed
+            AILogger.log("QUEUE CLAIMED: entry \(entryId) target user claimed by another account")
         }
 
         drainQueue(peerId: peerId)
@@ -174,7 +179,7 @@ public final class AIOutgoingMessageQueue {
                 } else {
                     AILogger.log("QUEUE E5: sendAction=false entry=\(entry.id) text='\(String(entry.originalText.prefix(40)))' — controller deallocated?")
                     entry.restoreAction(entry.originalText)
-                    entry.errorAction()
+                    entry.errorAction("Translation failed. Message not sent. Try again.")
                     for j in (i + 1)..<queue.count {
                         queue[j].translationDisposable.dispose()
                         queue[j].state = .cancelled
@@ -182,6 +187,19 @@ public final class AIOutgoingMessageQueue {
                     peerQueues[peerId] = nil
                     return
                 }
+
+            case .userClaimed:
+                // Target user is claimed by another account — reject immediately
+                AILogger.log("QUEUE CLAIM-BLOCK: entry \(entry.id) — rejecting message")
+                entry.restoreAction(entry.originalText)
+                entry.errorAction("This user was already claimed by someone else!")
+                // Cancel all subsequent messages for this peer too
+                for j in (i + 1)..<queue.count {
+                    queue[j].translationDisposable.dispose()
+                    queue[j].state = .cancelled
+                }
+                peerQueues[peerId] = nil
+                return
 
             case .failed:
                 AILogger.log("QUEUE E6: cascade fail entry=\(entry.id) text='\(String(entry.originalText.prefix(40)))'")
@@ -210,7 +228,7 @@ public final class AIOutgoingMessageQueue {
         failedEntry.restoreAction(failedEntry.originalText)
 
         // Show error popup (5 seconds)
-        failedEntry.errorAction()
+        failedEntry.errorAction("Translation failed. Message not sent. Try again.")
 
         // Clear the entire queue for this peer
         peerQueues[peerId] = nil

@@ -90,12 +90,12 @@ def patch_load_display_node(filepath: str) -> None:
 {indent}                            }}
 {indent}                        }}
 {indent}                    }},
-{indent}                    errorAction: {{ [weak strongSelf] in
+{indent}                    errorAction: {{ [weak strongSelf] message in
 {indent}                        guard let strongSelf = strongSelf else {{ return }}
-{indent}                        AILogger.log("POPUP SHOWN: Translation failed (compose bar)")
+{indent}                        AILogger.log("POPUP SHOWN: \\(message)")
 {indent}                        strongSelf.present(UndoOverlayController(
 {indent}                            presentationData: strongSelf.presentationData,
-{indent}                            content: .info(title: nil, text: "Translation failed. Message not sent. Try again.", timeout: 5.0, customUndoText: nil),
+{indent}                            content: .info(title: nil, text: message, timeout: 5.0, customUndoText: nil),
 {indent}                            elevatedLayout: true,
 {indent}                            action: {{ _ in return false }}
 {indent}                        ), in: .current)

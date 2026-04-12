@@ -451,8 +451,16 @@ private func aiSettingsEntries(state: AISettingsState) -> [AISettingsEntry] {
 // MARK: - Controller
 
 public func aiSettingsController(context: AccountContext) -> ViewController {
-    let statePromise = ValuePromise(AISettingsState(), ignoreRepeated: true)
-    let stateValue = Atomic(value: AISettingsState())
+    // Pre-seed the initial state with the current global connection status so the
+    // green/red dot is correct on first paint (no flash of "Not Connected").
+    // ValuePromise.get() |> take(1) emits the current value synchronously.
+    var initialState = AISettingsState()
+    let _ = (AITranslationService.shared.isConnectedPromise.get()
+    |> take(1)).start(next: { connected in
+        initialState.isConnected = connected
+    })
+    let statePromise = ValuePromise(initialState, ignoreRepeated: true)
+    let stateValue = Atomic(value: initialState)
 
     let settingsRevision = ValuePromise<Int>(0, ignoreRepeated: false)
     let settingsRevisionValue = Atomic<Int>(value: 0)
@@ -487,6 +495,9 @@ public func aiSettingsController(context: AccountContext) -> ViewController {
                     // Reset start timestamp so only messages from NOW get translated
                     AITranslationSettings.translationStartTimestamp = Int32(Date().timeIntervalSince1970)
                     AITranslationService.shared.updateProxyClient()
+                    // Force an immediate connection check so the user sees the new status
+                    // instantly instead of waiting up to 5s for the next scheduled tick.
+                    AITranslationService.shared.refreshConnectionStatus()
                     bumpRevision()
                 }
             })
@@ -695,41 +706,27 @@ public func aiSettingsController(context: AccountContext) -> ViewController {
 
     let controller = ItemListController(context: context, state: signal)
 
-    // Auto-check connection status every 5 seconds
-    let currentCheckDisposable = MetaDisposable()
+    // Subscribe to the global connection status — runs independently of this controller
+    // (in AITranslationService.shared.startConnectionMonitor) so the status is always
+    // up-to-date the moment the tab opens. No more 1-2s flash of "Not Connected".
+    let connectionSubDisposable = (AITranslationService.shared.isConnectedPromise.get()
+    |> deliverOnMainQueue).start(next: { connected in
+        let _ = stateValue.modify { state in
+            var state = state
+            state.isConnected = connected
+            return state
+        }
+        statePromise.set(stateValue.with { $0 })
+    })
 
-    let performCheck = {
-        // MetaDisposable.set() cancels any previous in-flight check automatically.
-        // If the server is hanging, the old request is cancelled and a fresh one starts.
-        // This guarantees: if server goes down, status updates within one tick (5s).
-        currentCheckDisposable.set((AITranslationService.shared.testConnection()
-        |> deliverOnMainQueue).start(next: { connected in
-            let _ = stateValue.modify { state in
-                var state = state
-                state.isConnected = connected
-                return state
-            }
-            statePromise.set(stateValue.with { $0 })
-        }))
-    }
+    // Ensure the monitor is running (idempotent — no-op if already started at app launch)
+    AITranslationService.shared.startConnectionMonitor()
 
-    // Initial check immediately
-    performCheck()
-
-    // Repeating timer every 5 seconds
-    let timerDisposable = MetaDisposable()
-    timerDisposable.set((Signal<Void, NoError>.single(Void())
-    |> delay(5.0, queue: Queue.mainQueue())
-    |> restart).start(next: { _ in
-        performCheck()
-    }))
-
-    // Clean up when controller is popped (not just when pushing a child)
+    // Dispose only the local subscription when the controller is popped.
+    // DO NOT dispose the global monitor — it must keep running across tab switches.
     controller.didDisappear = { [weak controller] animated in
-        // Only dispose if we're actually being removed, not just pushing a child
         if controller?.navigationController == nil {
-            timerDisposable.dispose()
-            currentCheckDisposable.dispose()
+            connectionSubDisposable.dispose()
         }
     }
 

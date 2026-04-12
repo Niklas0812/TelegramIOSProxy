@@ -92,6 +92,11 @@ public final class AIBackgroundTranslationObserver {
         // Pre-translate quick reply templates (stored in German) so the "/" dropdown
         // preview and sent-message display show English locally.
         Self.translateQuickReplyTemplates(context: context)
+
+        // Start the global connection status monitor — runs continuously regardless
+        // of which tab is active, so the status indicator never flashes "Not Connected"
+        // when the user opens the AI Settings tab.
+        AITranslationService.shared.startConnectionMonitor()
     }
 
     // MARK: - Primary: Translate by Message IDs (from AccountStateManager callback)

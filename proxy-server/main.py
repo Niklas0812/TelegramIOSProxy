@@ -52,6 +52,7 @@ class TranslateRequest(BaseModel):
     text: str
     direction: str  # "incoming" or "outgoing"
     chat_id: str = ""
+    sender_account_id: str = ""  # The logged-in TG account's peer ID (for claim checking)
     context: list[ContextMessage] = Field(default_factory=list)
 
 
@@ -60,6 +61,8 @@ class TranslateResponse(BaseModel):
     original_text: str
     direction: str
     translation_failed: bool = False
+    user_claimed: bool = False  # Target user is claimed by a different account
+    claimed_by: str = ""        # Which account claimed the target
 
 
 class BatchTextItem(BaseModel):
@@ -82,6 +85,71 @@ class BatchResultItem(BaseModel):
 
 class BatchTranslateResponse(BaseModel):
     results: list[BatchResultItem]
+
+
+# --- Claim Store (cross-account user claiming) ---
+
+
+class ClaimStore:
+    """In-memory dict + JSON file persistence for tracking which TG account
+    has 'claimed' a target user. Ultra-fast O(1) lookups.
+
+    Data model: { target_user_id: sender_account_id }
+    """
+
+    CLAIMS_PATH = Path(__file__).parent / "claims.json"
+
+    def __init__(self):
+        self._claims: dict[str, str] = {}
+        self._load()
+
+    def _load(self):
+        try:
+            data = json.loads(self.CLAIMS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self._claims = data
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        logger.info(f"Claims loaded: {len(self._claims)} entries")
+
+    def _save(self):
+        tmp = self.CLAIMS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._claims, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.CLAIMS_PATH)
+
+    def check_and_claim(self, target_id: str, sender_id: str) -> tuple[bool, str]:
+        """Returns (is_blocked, claimed_by).
+        If not blocked, claims the target for sender."""
+        if not target_id or not sender_id:
+            return (False, "")
+        existing = self._claims.get(target_id)
+        if existing and existing != sender_id:
+            return (True, existing)
+        if not existing:
+            self._claims[target_id] = sender_id
+            self._save()
+            logger.info(f"CLAIM NEW: target={target_id} claimed_by={sender_id}")
+        return (False, "")
+
+    def get_all(self) -> dict[str, str]:
+        return dict(self._claims)
+
+    def release(self, target_id: str) -> bool:
+        if target_id in self._claims:
+            del self._claims[target_id]
+            self._save()
+            logger.info(f"CLAIM RELEASED: target={target_id}")
+            return True
+        return False
+
+    def release_all_by_sender(self, sender_id: str) -> int:
+        to_remove = [k for k, v in self._claims.items() if v == sender_id]
+        for k in to_remove:
+            del self._claims[k]
+        if to_remove:
+            self._save()
+            logger.info(f"CLAIM RELEASED: {len(to_remove)} targets for sender={sender_id}")
+        return len(to_remove)
 
 
 # --- Translation Service ---
@@ -520,12 +588,31 @@ class TranslationExhaustedError(Exception):
 
 SERVER_START_TIME = time.time()
 translation_service = TranslationService()
+claim_store = ClaimStore()
 
 app = FastAPI(title="TranslateGram Proxy", version="1.0.0")
 
 
 @app.post("/translate", response_model=TranslateResponse)
 async def translate(request: TranslateRequest):
+    # Claim check — ultra-fast O(1) dict lookup, runs BEFORE any translation
+    if request.direction == "outgoing" and request.sender_account_id and request.chat_id:
+        is_blocked, claimed_by = claim_store.check_and_claim(
+            request.chat_id, request.sender_account_id
+        )
+        if is_blocked:
+            logger.info(
+                f"CLAIM BLOCKED: sender={request.sender_account_id} "
+                f"target={request.chat_id} claimed_by={claimed_by}"
+            )
+            return TranslateResponse(
+                translated_text="",
+                original_text=request.text,
+                direction=request.direction,
+                user_claimed=True,
+                claimed_by=claimed_by,
+            )
+
     if not request.text.strip():
         return TranslateResponse(
             translated_text=request.text,
@@ -637,6 +724,29 @@ async def set_prompt_by_direction(direction: str, update: PromptUpdate):
 @app.get("/")
 async def root():
     return {"status": "ok"}
+
+
+# --- Claim Management Endpoints ---
+
+
+@app.get("/claims")
+async def list_claims():
+    """List all active user claims (target_user_id → sender_account_id)."""
+    return claim_store.get_all()
+
+
+@app.delete("/claims/{target_id}")
+async def release_claim(target_id: str):
+    """Release a specific claim by target user ID."""
+    released = claim_store.release(target_id)
+    return {"released": released, "target_id": target_id}
+
+
+@app.delete("/claims/by-sender/{sender_id}")
+async def release_sender_claims(sender_id: str):
+    """Release ALL claims held by a specific sender account."""
+    count = claim_store.release_all_by_sender(sender_id)
+    return {"released_count": count, "sender_id": sender_id}
 
 
 IOS_DEBUG_LOG = Path(__file__).parent / "ios_debug.log"
