@@ -93,22 +93,30 @@ def patch_chat_controller(filepath: str) -> None:
                         context: self.context
                     ) |> deliverOnMainQueue
 
-                    aiTranslationDisposable.set(aiSignal.start(next: { [weak self] result in
+                    aiTranslationDisposable.set(aiSignal.start(next: { [weak self] outcome in
                         guard let self = self, !aiTranslationCompleted else { return }
                         aiTranslationCompleted = true
 
-                        if let translatedText = result, !translatedText.isEmpty {
+                        switch outcome {
+                        case .success(let translatedText), .passthrough(let translatedText):
                             var newMessages = aiOriginalMessages
                             if case let .message(text, attributes, inlineStickers, mediaReference, threadId, replyToMessageId, replyToStoryId, localGroupingKey, correlationId, bubbleUpEmojiOrStickersets) = aiOriginalMessages[aiCaptionIdx] {
                                 var newAttributes = attributes
                                 newAttributes.append(TranslationMessageAttribute(text: text, entities: [], toLang: "en"))
                                 newMessages[aiCaptionIdx] = .message(text: translatedText, attributes: newAttributes, inlineStickers: inlineStickers, mediaReference: mediaReference, threadId: threadId, replyToMessageId: replyToMessageId, replyToStoryId: replyToStoryId, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: bubbleUpEmojiOrStickersets)
                             }
-                            // Use enqueueMessages directly (same path as compose bar) to preserve TranslationMessageAttribute
                             AIBackgroundTranslationObserver.pendingCaptionOriginals["\\(aiPeerId.id._internalGetInt64Value())_\\(translatedText)"] = aiCaptionText
                             let _ = enqueueMessages(account: self.context.account, peerId: aiPeerId, messages: newMessages).start()
-                        } else {
-                            AILogger.log("POPUP SHOWN: caption fail — result=\\(result == nil ? "nil" : "empty")")
+                        case .userClaimed:
+                            AILogger.log("POPUP SHOWN: caption — user claimed")
+                            self.present(UndoOverlayController(
+                                presentationData: self.presentationData,
+                                content: .info(title: nil, text: "This user was already claimed by someone else!", timeout: 5.0, customUndoText: nil),
+                                elevatedLayout: true,
+                                action: { _ in return false }
+                            ), in: .current)
+                        case .translationFailed:
+                            AILogger.log("POPUP SHOWN: caption translation failed")
                             self.present(UndoOverlayController(
                                 presentationData: self.presentationData,
                                 content: .info(title: nil, text: "Translation failed. Message not sent. Try again.", timeout: 5.0, customUndoText: nil),
