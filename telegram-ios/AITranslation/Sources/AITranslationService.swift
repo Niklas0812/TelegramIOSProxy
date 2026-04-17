@@ -251,55 +251,89 @@ public final class AITranslationService {
         AILogger.log("OUT START: chat=\(chatIdInt) sender=\(senderAccountId) text='\(textPreview)'")
 
         return combineLatest(contextSignal, historySignal)
-        |> mapToSignal { contextMessages, hasTwoSided -> Signal<OutgoingTranslationResult, NoError> in
+        |> mapToSignal { [weak self] contextMessages, hasTwoSided -> Signal<OutgoingTranslationResult, NoError> in
+            guard let self = self else { return .single(.translationFailed) }
             AILogger.log("OUT: context ready (\(contextMessages.count) msgs) twoSided=\(hasTwoSided), firing HTTP...")
-            return client.translateStrictDetailed(
+            return self.outgoingTranslateAttempt(
                 text: text,
-                direction: "outgoing",
-                chatId: chatIdInt,
+                chatIdInt: chatIdInt,
                 senderAccountId: senderAccountId,
                 hasTwoSidedHistory: hasTwoSided,
-                context: contextMessages
+                contextMessages: contextMessages,
+                textPreview: textPreview,
+                attemptNumber: 1,
+                maxAttempts: 3,
+                backoffSeconds: 2.0
             )
-            |> mapToSignal { result -> Signal<OutgoingTranslationResult, NoError> in
-                switch result {
-                case .success(let translatedText):
-                    AILogger.log("OUT OK: '\(textPreview)' -> '\(String(translatedText.prefix(40)))'")
-                    return .single(.success(translatedText))
-                case .userClaimed:
-                    AILogger.log("OUT CLAIMED: target=\(chatIdInt) sender=\(senderAccountId) twoSided=\(hasTwoSided)")
-                    return .single(.userClaimed)
-                case .backendFailure:
-                    AILogger.log("OUT E2: backendFailure text='\(textPreview)'")
+        }
+    }
+
+    /// One attempt of the outgoing translate call. On `iosError` (network/DNS/timeouts)
+    /// waits `backoffSeconds` and retries up to `maxAttempts` total. The backoff is
+    /// important for `-1003` specifically: iOS caches "host not found" at the system
+    /// DNS level (below URLSession), and an immediate retry hits that cached negative
+    /// result within 1-4ms and fails again. A 2s pause lets the system resolver age
+    /// out the cached entry so the next attempt does a fresh lookup.
+    private func outgoingTranslateAttempt(
+        text: String,
+        chatIdInt: Int64,
+        senderAccountId: Int64,
+        hasTwoSidedHistory: Bool,
+        contextMessages: [AIContextMessage],
+        textPreview: String,
+        attemptNumber: Int,
+        maxAttempts: Int,
+        backoffSeconds: Double
+    ) -> Signal<OutgoingTranslationResult, NoError> {
+        if proxyClient == nil {
+            updateProxyClient()
+        }
+        guard let client = proxyClient else {
+            AILogger.log("OUT E3: proxyClient nil on attempt \(attemptNumber)")
+            return .single(.translationFailed)
+        }
+        return client.translateStrictDetailed(
+            text: text,
+            direction: "outgoing",
+            chatId: chatIdInt,
+            senderAccountId: senderAccountId,
+            hasTwoSidedHistory: hasTwoSidedHistory,
+            context: contextMessages
+        )
+        |> mapToSignal { [weak self] result -> Signal<OutgoingTranslationResult, NoError> in
+            guard let self = self else { return .single(.translationFailed) }
+            switch result {
+            case .success(let translatedText):
+                AILogger.log("OUT OK(attempt \(attemptNumber)/\(maxAttempts)): '\(textPreview)' -> '\(String(translatedText.prefix(40)))'")
+                return .single(.success(translatedText))
+            case .userClaimed:
+                AILogger.log("OUT CLAIMED(attempt \(attemptNumber)/\(maxAttempts)): target=\(chatIdInt)")
+                return .single(.userClaimed)
+            case .backendFailure:
+                AILogger.log("OUT E2(attempt \(attemptNumber)/\(maxAttempts)): backendFailure text='\(textPreview)'")
+                return .single(.translationFailed)
+            case .iosError:
+                if attemptNumber >= maxAttempts {
+                    AILogger.log("OUT E4: exhausted \(maxAttempts) attempts text='\(textPreview)'")
                     return .single(.translationFailed)
-                case .iosError:
-                    AILogger.log("OUT: iosError on 1st attempt, retrying with fresh client...")
-                    self.updateProxyClient()
-                    guard let freshClient = self.proxyClient else {
-                        AILogger.log("OUT E3: freshClient nil after update")
-                        return .single(.translationFailed)
-                    }
-                    return freshClient.translateStrictDetailed(
+                }
+                AILogger.log("OUT: iosError attempt \(attemptNumber)/\(maxAttempts) — recreating proxy client, backing off \(backoffSeconds)s for DNS cache to expire")
+                self.updateProxyClient()
+                return Signal<Void, NoError>.single(())
+                |> delay(backoffSeconds, queue: Queue.mainQueue())
+                |> mapToSignal { [weak self] _ -> Signal<OutgoingTranslationResult, NoError> in
+                    guard let self = self else { return .single(.translationFailed) }
+                    return self.outgoingTranslateAttempt(
                         text: text,
-                        direction: "outgoing",
-                        chatId: chatIdInt,
+                        chatIdInt: chatIdInt,
                         senderAccountId: senderAccountId,
-                        hasTwoSidedHistory: hasTwoSided,
-                        context: contextMessages
+                        hasTwoSidedHistory: hasTwoSidedHistory,
+                        contextMessages: contextMessages,
+                        textPreview: textPreview,
+                        attemptNumber: attemptNumber + 1,
+                        maxAttempts: maxAttempts,
+                        backoffSeconds: backoffSeconds
                     )
-                    |> map { retryResult -> OutgoingTranslationResult in
-                        switch retryResult {
-                        case .success(let retryText):
-                            AILogger.log("OUT OK(retry): '\(textPreview)' -> '\(String(retryText.prefix(40)))'")
-                            return .success(retryText)
-                        case .userClaimed:
-                            AILogger.log("OUT CLAIMED(retry): target=\(chatIdInt)")
-                            return .userClaimed
-                        default:
-                            AILogger.log("OUT E4: retry failed text='\(textPreview)'")
-                            return .translationFailed
-                        }
-                    }
                 }
             }
         }

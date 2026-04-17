@@ -47,11 +47,29 @@ NSSM_RESTART_TIMEOUT_SECONDS = 90
 BACKEND_SERVICE_NAME = "TranslateGramBackend"
 NSSM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nssm.exe")
 
+# Script-owned log file, written directly by Python. We do NOT rely on NSSM's
+# stdout capture (AppStdout) because that pipe gets wedged on Windows when the
+# service cycles rapidly or a previous python.exe leaves a stale handle. Writing
+# directly from Python gives deterministic evidence of whether the script ran.
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "watchdog_script.log")
+
 
 def log(msg: str) -> None:
-    # NSSM captures stdout to watchdog_stdout.log — any output here is useful
-    # forensic data for the next incident.
-    print(f"[watchdog] {msg}", flush=True)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] [watchdog] {msg}\n"
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        # Never let logging failure crash the watchdog — its job is to check
+        # the backend, not to log perfectly.
+        pass
+    # Also emit to stdout so manual `python watchdog.py` runs are interactive.
+    try:
+        print(f"[watchdog] {msg}", flush=True)
+    except Exception:
+        pass
 
 
 def check_health_once() -> bool:
@@ -112,4 +130,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # NSSM raises SIGINT-equivalent when stopping the service (e.g. during
+        # reinstall). Exit quietly instead of filling stderr with tracebacks.
+        log("interrupted during cycle — exiting quietly")
+        sys.exit(0)

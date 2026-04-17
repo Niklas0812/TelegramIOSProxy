@@ -295,11 +295,18 @@ class TranslationService:
             "retries": 0,
             "fallbacks": 0,
             "cache_hits": 0,
+            "inflight_dedup_hits": 0,
             "total_response_time_ms": 0.0,
         }
         self.last_successful_translation: Optional[float] = None
         self._prompt_cache: dict[str, str] = {}
         self._translation_cache: dict[str, str] = self._load_translation_cache()
+        # In-flight request deduplication. When two identical (text, direction)
+        # requests arrive within the AI-call window, the second awaits the first's
+        # result instead of firing another OpenRouter call. Prevents pile-up on
+        # duplicate traffic (observed in prod: same text fired 480ms apart, both
+        # missed the cache and both hit the API).
+        self._inflight: dict[str, asyncio.Future] = {}
         self._load_prompts()
         logger.info(f"Translation cache loaded: {len(self._translation_cache)} entries")
 
@@ -485,6 +492,37 @@ class TranslationService:
                 translation_failed=False,
             )
 
+        # In-flight dedup: if an identical (text, direction) request is already
+        # mid-flight, await its result instead of firing a second OpenRouter call.
+        # The existing cache-race hole (two copies of the same text arriving
+        # <500ms apart both missing the cache and both hitting the API) is closed
+        # here — the second caller attaches to the first's future.
+        inflight = self._inflight.get(cache_key)
+        if inflight is not None:
+            try:
+                deduped = await inflight
+                self.stats["inflight_dedup_hits"] += 1
+                self.stats["successful"] += 1
+                logger.info(
+                    f"chat_id={request.chat_id} dir={request.direction} "
+                    f"len={len(request.text)} INFLIGHT "
+                    f"| {request.text[:80]} -> {deduped[:80]}"
+                )
+                return TranslateResponse(
+                    translated_text=deduped,
+                    original_text=request.text,
+                    direction=request.direction,
+                    translation_failed=False,
+                )
+            except Exception:
+                # First request failed — fall through and try our own fresh call.
+                pass
+
+        # Register this request as in-flight so any later duplicate waits on us.
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        self._inflight[cache_key] = future
+
         start_time = time.time()
 
         system_prompt = self._read_system_prompt(request.direction)
@@ -522,6 +560,17 @@ class TranslationService:
             if translated_text != request.text:
                 self._translation_cache[cache_key] = translated_text
                 self._save_translation_cache()
+            # Share result with any waiters on the in-flight future.
+            if not future.done():
+                future.set_result(translated_text)
+        else:
+            # Signal exhaustion so waiters fall through to their own attempt.
+            if not future.done():
+                future.set_exception(RuntimeError("translation exhausted"))
+
+        # Clear in-flight slot last so new duplicates get the cached value instead
+        # of attaching to a resolved future.
+        self._inflight.pop(cache_key, None)
 
         logger.info(
             f"chat_id={request.chat_id} dir={request.direction} "
