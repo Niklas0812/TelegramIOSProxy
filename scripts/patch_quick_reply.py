@@ -6,22 +6,30 @@ via the server API directly (messages.sendQuickReplyMessages), bypassing all loc
 translation patches.
 
 In our setup, quick reply templates are stored in GERMAN on the account. The user
-sees German templates in the "/" dropdown and they are sent in German to the
-recipient. But we want the LOCAL display (both in the "/" preview and in the sent
-message bubble) to show ENGLISH.
+sees English in the "/" dropdown (via the `quickReplyTranslations` cache populated
+by `AIBackgroundTranslationObserver.translateQuickReplyTemplates()`). When a template
+is sent, we now want it to go through the SAME outgoing translation pipeline as a
+regular typed message: the cached ENGLISH text is fed into `AIOutgoingMessageQueue`,
+which calls `translateOutgoingStrict()` (EN→DE, claim-checked). The resulting fresh
+German is sent to the recipient; locally we attach a `TranslationMessageAttribute`
+carrying the English so the sent bubble renders in English.
 
-This patch intercepts sendMessageShortcut, fetches the shortcut's messages from the
-local viewTracker, and enqueues them directly — preserving the German text (so the
-recipient still gets German) but attaching a `TranslationMessageAttribute` with the
-pre-computed English translation from `AIBackgroundTranslationObserver.quickReplyTranslations`.
+This fixes two problems at once:
+  1. Templates now go through the outgoing pipeline (claim check applies, fresh
+     translation every send, consistent with typed-text behavior).
+  2. Media+caption templates no longer pop "Translation failed" — the caption
+     is translated inside the queue's sendAction and sent as one message with the
+     photo's media reference preserved.
 
-That attribute is what `patch_text_bubble.py` uses to render the message locally
-in English via Telegram's native translation display path.
+Paths:
+  - Text-only template with cached English  → AIOutgoingMessageQueue.enqueue
+  - Picture+caption template with cached English → AIOutgoingMessageQueue.enqueue,
+    sendAction attaches mediaReference
+  - Media-only template (empty text)        → direct enqueueMessages (nothing to translate)
+  - Cache miss (scan not done yet)          → direct enqueueMessages (German as-is)
 
-IMPORTANT: We do NOT route through `self.sendMessages()` here because that would hit
-`patch_chat_controller.py` which tries to translate English → German on the caption
-text. Since the template is ALREADY German, that would double-translate (or fail,
-causing a "Translation failed" popup). We call `enqueueMessages()` directly instead.
+Translation-disabled / bot chat / non-whitelisted chat: passes through to the
+original sendMessageShortcut() API unchanged.
 """
 import sys
 
@@ -42,59 +50,103 @@ def patch_quick_reply(filepath: str) -> None:
         sys.exit(1)
 
     new_code = """// AI Translation: intercept quick reply
-            // Templates are stored in German. We send them as-is (German) to the recipient,
-            // but attach a TranslationMessageAttribute with the pre-computed English text so
-            // the local display renders English. We call enqueueMessages directly to bypass
-            // sendMessages() which would otherwise try to translate English→German on the
-            // already-German text.
+            // Templates are stored in German; the English versions are cached in
+            // AIBackgroundTranslationObserver.quickReplyTranslations. On send we route the
+            // cached ENGLISH text through AIOutgoingMessageQueue — same pipeline as typed
+            // text — so translation is fresh, claim checks apply, and the sent bubble shows
+            // English locally via the attached TranslationMessageAttribute. Media+caption
+            // templates are handled via the same path with a mediaReference attached inside
+            // the sendAction closure.
             let _ = (self.context.account.viewTracker.quickReplyMessagesViewForLocation(quickReplyId: shortcutId)
             |> take(1)
             |> deliverOnMainQueue).start(next: { [weak self] view, _, _ in
                 guard let self = self else { return }
+
+                // Claim guard — fires /claim once per shortcut send so every quick
+                // reply (text, text+media, media-only, AND the translation-disabled
+                // passthrough to sendMessageShortcut below) registers the claim on the
+                // backend. Placed BEFORE the disabled-chat fall-throughs so even those
+                // bypass paths still hit /claim. Fire-and-forget: text entries will
+                // re-check via /translate anyway.
+                if !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) && peerId.id._internalGetInt64Value() != 777000 {
+                    AILogger.log("OUT-PATH [quick-reply]: peer=\\(peerId.id._internalGetInt64Value()) entries=\\(view.entries.count)")
+                    let _ = AITranslationService.shared.applyClaimGuard(chatId: peerId, context: self.context).start()
+                }
 
                 if !AITranslationSettings.enabled || AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) || (!AITranslationSettings.enabledChatIds.isEmpty && !AITranslationSettings.enabledChatIds.contains(peerId.id._internalGetInt64Value())) {
                     self.context.engine.accountData.sendMessageShortcut(peerId: peerId, id: shortcutId)
                     return
                 }
 
-                var messagesToSend: [EnqueueMessage] = []
-                for entry in view.entries {
-                    let msg = entry.message
-                    let text = msg.text
-
-                    // Look up the pre-computed English translation of this template.
-                    // If missing (e.g. scan hasn't completed yet), fall back to the German
-                    // text — the user will see German locally until the background scan
-                    // finishes and the attribute is re-attached on next open.
-                    var attributes: [MessageAttribute] = []
-                    if let english = AIBackgroundTranslationObserver.quickReplyTranslations[msg.id], !english.isEmpty {
-                        attributes.append(TranslationMessageAttribute(text: english, entities: [], toLang: "en"))
-                    }
-
-                    let mediaRef = msg.media.first.flatMap { AnyMediaReference.standalone(media: $0) }
-                    messagesToSend.append(.message(
-                        text: text,
-                        attributes: attributes,
-                        inlineStickers: [:],
-                        mediaReference: mediaRef,
-                        threadId: self.chatLocation.threadId,
-                        replyToMessageId: nil,
-                        replyToStoryId: nil,
-                        localGroupingKey: nil,
-                        correlationId: nil,
-                        bubbleUpEmojiOrStickersets: []
-                    ))
-                }
-
-                if messagesToSend.isEmpty {
+                if view.entries.isEmpty {
                     self.context.engine.accountData.sendMessageShortcut(peerId: peerId, id: shortcutId)
                     return
                 }
 
-                // Call enqueueMessages DIRECTLY — bypass self.sendMessages() which would
-                // trigger patch_chat_controller.py to translate German→English→... Germ.
-                AILogger.log("QR-SEND: sending \\(messagesToSend.count) template(s) to peer \\(peerId.id._internalGetInt64Value())")
-                let _ = enqueueMessages(account: self.context.account, peerId: peerId, messages: messagesToSend).start()
+                let threadId = self.chatLocation.threadId
+
+                for entry in view.entries {
+                    let msg = entry.message
+                    let storedText = msg.text
+                    let mediaRef: AnyMediaReference? = msg.media.first.flatMap { AnyMediaReference.standalone(media: $0) }
+                    let cachedEnglish = AIBackgroundTranslationObserver.quickReplyTranslations[msg.id]
+
+                    // Case: media-only template — no caption to translate, send directly.
+                    if storedText.isEmpty {
+                        AILogger.log("QR-SEND MEDIA-ONLY: msg=\\(msg.id.id) peer=\\(peerId.id._internalGetInt64Value()) hasMedia=\\(mediaRef != nil)")
+                        let _ = enqueueMessages(account: self.context.account, peerId: peerId, messages: [
+                            .message(text: "", attributes: [], inlineStickers: [:],
+                                     mediaReference: mediaRef, threadId: threadId,
+                                     replyToMessageId: nil, replyToStoryId: nil,
+                                     localGroupingKey: nil, correlationId: nil,
+                                     bubbleUpEmojiOrStickersets: [])
+                        ]).start()
+                        continue
+                    }
+
+                    // Case: text template — ALWAYS route through AIOutgoingMessageQueue to guarantee
+                    // translation. Prefer the cached English source (canonical). If the cache is
+                    // missing (background scan hasn't completed or failed), fall back to msg.text —
+                    // this handles English-stored templates correctly (the outgoing pipeline will
+                    // translate EN→DE), and for German-stored templates the AI returns German
+                    // unchanged. Direct enqueue of raw stored text is NOT safe because an
+                    // English-stored template would leak untranslated to the recipient.
+                    let sourceText = (cachedEnglish?.isEmpty == false) ? cachedEnglish! : storedText
+                    let sourceLabel = (cachedEnglish?.isEmpty == false) ? "cache" : "stored"
+                    AILogger.log("QR-SEND QUEUE: enqueue msg=\\(msg.id.id) peer=\\(peerId.id._internalGetInt64Value()) hasMedia=\\(mediaRef != nil) src=\\(sourceLabel) text='\\(String(sourceText.prefix(40)))'")
+                    AIOutgoingMessageQueue.shared.enqueue(
+                        text: sourceText,
+                        peerId: peerId,
+                        context: self.context,
+                        sendAction: { [weak self] translatedText -> Bool in
+                            guard let self = self else { return false }
+                            let attrs: [MessageAttribute] = [
+                                TranslationMessageAttribute(text: sourceText, entities: [], toLang: "en")
+                            ]
+                            let _ = enqueueMessages(account: self.context.account, peerId: peerId, messages: [
+                                .message(text: translatedText, attributes: attrs, inlineStickers: [:],
+                                         mediaReference: mediaRef, threadId: threadId,
+                                         replyToMessageId: nil, replyToStoryId: nil,
+                                         localGroupingKey: nil, correlationId: nil,
+                                         bubbleUpEmojiOrStickersets: [])
+                            ]).start()
+                            return true
+                        },
+                        restoreAction: { _ in
+                            // Quick reply has no input box to restore — no-op.
+                        },
+                        errorAction: { [weak self] message in
+                            guard let self = self else { return }
+                            AILogger.log("POPUP SHOWN: quick reply — \\(message)")
+                            self.present(UndoOverlayController(
+                                presentationData: self.presentationData,
+                                content: .info(title: nil, text: message, timeout: 5.0, customUndoText: nil),
+                                elevatedLayout: true,
+                                action: { _ in return false }
+                            ), in: .current)
+                        }
+                    )
+                }
             })"""
 
     content = content.replace(old_code, new_code, 1)
@@ -102,7 +154,7 @@ def patch_quick_reply(filepath: str) -> None:
     with open(filepath, "w") as f:
         f.write(content)
 
-    print(f"Patched {filepath}: quick reply shortcut translation (direct enqueue)")
+    print(f"Patched {filepath}: quick reply shortcut now routes through AIOutgoingMessageQueue")
 
 
 if __name__ == "__main__":

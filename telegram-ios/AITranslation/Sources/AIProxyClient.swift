@@ -8,6 +8,7 @@ public struct AITranslateRequest: Codable {
     public let direction: String
     public let chatId: String
     public let senderAccountId: String
+    public let hasTwoSidedHistory: Bool
     public let context: [AIContextMessage]
 
     enum CodingKeys: String, CodingKey {
@@ -15,14 +16,16 @@ public struct AITranslateRequest: Codable {
         case direction
         case chatId = "chat_id"
         case senderAccountId = "sender_account_id"
+        case hasTwoSidedHistory = "has_two_sided_history"
         case context
     }
 
-    public init(text: String, direction: String, chatId: String, senderAccountId: String = "", context: [AIContextMessage]) {
+    public init(text: String, direction: String, chatId: String, senderAccountId: String = "", hasTwoSidedHistory: Bool = false, context: [AIContextMessage]) {
         self.text = text
         self.direction = direction
         self.chatId = chatId
         self.senderAccountId = senderAccountId
+        self.hasTwoSidedHistory = hasTwoSidedHistory
         self.context = context
     }
 }
@@ -126,6 +129,53 @@ public enum AITranslationError: Error {
     case decodingError
     case invalidURL
     case timeout
+}
+
+// MARK: - Claim Guard Models
+
+public struct AIClaimRequest: Codable {
+    public let senderAccountId: String
+    public let chatId: String
+    public let hasTwoSidedHistory: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case senderAccountId = "sender_account_id"
+        case chatId = "chat_id"
+        case hasTwoSidedHistory = "has_two_sided_history"
+    }
+
+    public init(senderAccountId: String, chatId: String, hasTwoSidedHistory: Bool) {
+        self.senderAccountId = senderAccountId
+        self.chatId = chatId
+        self.hasTwoSidedHistory = hasTwoSidedHistory
+    }
+}
+
+public struct AIClaimResponse: Codable {
+    public let allowed: Bool
+    public let userClaimed: Bool
+    public let claimedBy: String
+
+    enum CodingKeys: String, CodingKey {
+        case allowed
+        case userClaimed = "user_claimed"
+        case claimedBy = "claimed_by"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        allowed = try container.decodeIfPresent(Bool.self, forKey: .allowed) ?? true
+        userClaimed = try container.decodeIfPresent(Bool.self, forKey: .userClaimed) ?? false
+        claimedBy = try container.decodeIfPresent(String.self, forKey: .claimedBy) ?? ""
+    }
+}
+
+/// Result of a pre-flight claim registration call.
+public enum AIClaimGuardResult {
+    case allowed            // Sender owns or just acquired the claim; proceed.
+    case blocked(String)    // Different account claims this target (claimed_by).
+    case networkError       // Backend unreachable — fail-open: allow the local send
+                            // so users aren't blocked from sending when the proxy is down.
 }
 
 // MARK: - Strict Translation Result
@@ -318,6 +368,7 @@ public final class AIProxyClient {
         direction: String,
         chatId: Int64,
         senderAccountId: Int64 = 0,
+        hasTwoSidedHistory: Bool = false,
         context: [AIContextMessage]
     ) -> Signal<StrictTranslationResult, NoError> {
         guard let url = URL(string: "\(baseURL)/translate") else {
@@ -330,6 +381,7 @@ public final class AIProxyClient {
             direction: direction,
             chatId: String(chatId),
             senderAccountId: senderAccountId != 0 ? String(senderAccountId) : "",
+            hasTwoSidedHistory: hasTwoSidedHistory,
             context: context
         )
 
@@ -526,6 +578,83 @@ public final class AIProxyClient {
         }
     }
 
+    // MARK: - Claim Guard
+
+    /// POST /claim — pre-flight claim registration for every outgoing send.
+    /// Decoupled from /translate so untranslated paths (passthrough, forwards,
+    /// media-only templates, toggle-off chats) still register the claim.
+    public func registerClaim(
+        chatId: Int64,
+        senderAccountId: Int64,
+        hasTwoSidedHistory: Bool
+    ) -> Signal<AIClaimGuardResult, NoError> {
+        guard let url = URL(string: "\(baseURL)/claim") else {
+            AILogger.log("CLAIM E0: invalid URL — baseURL='\(baseURL)'")
+            return .single(.networkError)
+        }
+
+        let request = AIClaimRequest(
+            senderAccountId: String(senderAccountId),
+            chatId: String(chatId),
+            hasTwoSidedHistory: hasTwoSidedHistory
+        )
+
+        return Signal { subscriber in
+            var urlRequest = URLRequest(url: url)
+            urlRequest.httpMethod = "POST"
+            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            urlRequest.timeoutInterval = 8.0
+
+            do {
+                urlRequest.httpBody = try JSONEncoder().encode(request)
+            } catch {
+                subscriber.putNext(.networkError)
+                subscriber.putCompletion()
+                return EmptyDisposable
+            }
+
+            let httpStart = CFAbsoluteTimeGetCurrent()
+            let task = self.outgoingSession.dataTask(with: urlRequest) { data, response, error in
+                let httpMs = Int((CFAbsoluteTimeGetCurrent() - httpStart) * 1000)
+                let httpStatus = (response as? HTTPURLResponse)?.statusCode ?? -1
+
+                if let error = error {
+                    let nsErr = error as NSError
+                    AILogger.log("CLAIM ERR-NET: \(httpMs)ms status=\(httpStatus) domain=\(nsErr.domain) code=\(nsErr.code) target=\(request.chatId)")
+                    subscriber.putNext(.networkError)
+                    subscriber.putCompletion()
+                    return
+                }
+
+                guard let data = data else {
+                    AILogger.log("CLAIM ERR-NODATA: \(httpMs)ms status=\(httpStatus) target=\(request.chatId)")
+                    subscriber.putNext(.networkError)
+                    subscriber.putCompletion()
+                    return
+                }
+
+                do {
+                    let resp = try JSONDecoder().decode(AIClaimResponse.self, from: data)
+                    if resp.allowed {
+                        AILogger.log("CLAIM OK: \(httpMs)ms target=\(request.chatId) sender=\(request.senderAccountId)")
+                        subscriber.putNext(.allowed)
+                    } else {
+                        AILogger.log("CLAIM BLOCKED: \(httpMs)ms target=\(request.chatId) sender=\(request.senderAccountId) claimed_by=\(resp.claimedBy)")
+                        subscriber.putNext(.blocked(resp.claimedBy))
+                    }
+                } catch {
+                    let bodyPreview = String(data: data.prefix(200), encoding: .utf8) ?? "(binary)"
+                    AILogger.log("CLAIM ERR-DECODE: \(httpMs)ms \(error) status=\(httpStatus) body=\(bodyPreview)")
+                    subscriber.putNext(.networkError)
+                }
+                subscriber.putCompletion()
+            }
+            task.resume()
+
+            return ActionDisposable { task.cancel() }
+        }
+    }
+
     // MARK: - Health Check
 
     public func healthCheck() -> Signal<Bool, NoError> {
@@ -535,7 +664,9 @@ public final class AIProxyClient {
 
         return Signal { subscriber in
             var request = URLRequest(url: url)
-            request.timeoutInterval = 4.0
+            // 10s tolerance absorbs backend cold-start windows and brief
+            // Caddy-upstream hiccups without flipping the UI to "not connected".
+            request.timeoutInterval = 10.0
             let task = self.session.dataTask(with: request) { data, response, error in
                 if let _ = error {
                     subscriber.putNext(false)

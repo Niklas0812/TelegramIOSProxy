@@ -55,10 +55,14 @@ REM Logging
 "%NSSM%" set %SERVICE_NAME% AppRotateFiles 1
 "%NSSM%" set %SERVICE_NAME% AppRotateBytes 1048576
 
-REM Auto-start on boot, restart on ANY exit (this is the cycle mechanism)
+REM Auto-start on boot, restart on ANY exit (this is the cycle mechanism).
+REM AppRestartDelay sets the gap between watchdog passes — 15s gives the backend
+REM room to finish a cold start (pydantic/FastAPI import chain is slow) before
+REM the next health probe. Previous value (0) caused tight restart loops that
+REM killed the backend mid-startup.
 "%NSSM%" set %SERVICE_NAME% Start SERVICE_AUTO_START
 "%NSSM%" set %SERVICE_NAME% AppExit Default Restart
-"%NSSM%" set %SERVICE_NAME% AppRestartDelay 0
+"%NSSM%" set %SERVICE_NAME% AppRestartDelay 15000
 
 REM Start the service
 echo.
@@ -67,6 +71,6 @@ echo Starting %SERVICE_NAME%...
 
 echo.
 echo Service %SERVICE_NAME% installed and started.
-echo Cycle: sleep 5s, check /health, exit, NSSM restarts, repeat.
+echo Cycle: sleep 30s, check /health with 3 retries, exit, NSSM waits 15s, repeat.
 echo.
 pause

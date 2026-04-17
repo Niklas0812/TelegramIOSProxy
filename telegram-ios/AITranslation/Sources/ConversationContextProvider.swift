@@ -5,6 +5,34 @@ import Postbox
 import AccountContext
 
 public final class ConversationContextProvider {
+    /// Checks whether the chat has two-sided history: at least one message
+    /// authored by the logged-in account AND at least one message authored by
+    /// any other peer. Scans up to 50 recent cloud messages in the peer.
+    /// Used by outgoing translation to bypass the cross-account claim block
+    /// when a conversation is already active.
+    public static func hasTwoSidedHistory(
+        chatId: PeerId,
+        context: AccountContext
+    ) -> Signal<Bool, NoError> {
+        let accountPeerId = context.account.peerId
+        return context.account.postbox.transaction { transaction -> Bool in
+            var hasSelf = false
+            var hasOther = false
+            transaction.scanTopMessages(peerId: chatId, namespace: Namespaces.Message.Cloud, limit: 50) { message in
+                if let authorId = message.author?.id {
+                    if authorId == accountPeerId {
+                        hasSelf = true
+                    } else {
+                        hasOther = true
+                    }
+                }
+                // Early exit once both sides are confirmed.
+                return !(hasSelf && hasOther)
+            }
+            return hasSelf && hasOther
+        }
+    }
+
     /// Fetches the last N messages from a chat for conversation context.
     /// Returns messages in chronological order with role labels.
     public static func getContext(

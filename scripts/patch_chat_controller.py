@@ -52,6 +52,20 @@ def patch_chat_controller(filepath: str) -> None:
 
     # Inject the translation guard right after the opening brace
     translation_guard = """
+        // AI Translation: claim guard (fire-and-forget) — decouples claim registration
+        // from translation. Fires /claim for every outgoing message that reaches
+        // sendMessages(), so media-only sends, forwards, and translation-disabled
+        // chats still register the sender's claim on the target. Fire-and-forget:
+        // we don't block the sync send flow on the HTTP round-trip. Enforcement for
+        // this path continues to happen via the translateOutgoingStrict call below
+        // when translation applies.
+        if let aiClaimPeerId = self.chatLocation.peerId,
+           !AIBackgroundTranslationObserver.botChatIds.contains(aiClaimPeerId.id._internalGetInt64Value()),
+           aiClaimPeerId.id._internalGetInt64Value() != 777000 {
+            AILogger.log("OUT-PATH [chat-controller-sendMessages]: peer=\\(aiClaimPeerId.id._internalGetInt64Value()) msgCount=\\(messages.count)")
+            let _ = AITranslationService.shared.applyClaimGuard(chatId: aiClaimPeerId, context: self.context).start()
+        }
+
         // AI Translation: media caption translation guard
         // Translates caption text, then enqueues ENTIRE batch directly to preserve album grouping
         // and TranslationMessageAttribute (same path as compose bar text).

@@ -20,6 +20,13 @@ public final class AITranslationService {
     private let connectionMonitorDisposable = MetaDisposable()
     private let connectionCheckDisposable = MetaDisposable()
     private var connectionMonitorStarted = false
+    // Rolling counter of consecutive health-check failures. After
+    // `connectionFailureResetThreshold` failures we recreate the proxy client
+    // so any stuck URLSession state (DNS cache holding an NSURLErrorCannotFindHost
+    // verdict, bad keep-alive, etc.) gets cleared without waiting for an app
+    // restart.
+    private var consecutiveConnectionFailures: Int = 0
+    private let connectionFailureResetThreshold = 3
 
     private init() {
         // Trigger AILogger lifecycle observer setup
@@ -57,7 +64,22 @@ public final class AITranslationService {
             // MetaDisposable.set() cancels any previous in-flight check automatically.
             // If the server is hanging, the old request is cancelled and a fresh one starts.
             self.connectionCheckDisposable.set((self.testConnection()
-            |> deliverOnMainQueue).start(next: { connected in
+            |> deliverOnMainQueue).start(next: { [weak self] connected in
+                guard let self = self else { return }
+                if connected {
+                    if self.consecutiveConnectionFailures > 0 {
+                        AILogger.log("CONN-MONITOR: recovered after \(self.consecutiveConnectionFailures) failure(s)")
+                    }
+                    self.consecutiveConnectionFailures = 0
+                } else {
+                    self.consecutiveConnectionFailures += 1
+                    AILogger.log("CONN-MONITOR: health check failed (#\(self.consecutiveConnectionFailures))")
+                    if self.consecutiveConnectionFailures >= self.connectionFailureResetThreshold {
+                        AILogger.log("CONN-MONITOR: \(self.consecutiveConnectionFailures) consecutive failures — recreating proxy client to clear URLSession/DNS state")
+                        self.updateProxyClient()
+                        self.consecutiveConnectionFailures = 0
+                    }
+                }
                 self.isConnectedPromise.set(connected)
             }))
         }
@@ -84,6 +106,50 @@ public final class AITranslationService {
         |> deliverOnMainQueue).start(next: { [weak self] connected in
             self?.isConnectedPromise.set(connected)
         }))
+    }
+
+    // MARK: - Outgoing Claim Guard (decoupled from translation)
+
+    /// Fires a pre-flight /claim call for an outgoing send. MUST be called by
+    /// every outgoing code path — translated OR untranslated — so the claim
+    /// system isn't coupled to whether translation happens.
+    ///
+    /// Behavior:
+    /// - Skips bot chats and the Telegram Service Notifications peer.
+    /// - Computes `hasTwoSidedHistory` from Postbox so the server-side bypass
+    ///   applies identically whether the path will translate or not.
+    /// - On network error: returns `.networkError`, callers fail-open (let the
+    ///   message send locally). Keeping users able to send when the backend
+    ///   is down is more important than strict claim enforcement.
+    public func applyClaimGuard(
+        chatId: PeerId,
+        context: AccountContext
+    ) -> Signal<AIClaimGuardResult, NoError> {
+        let targetId = chatId.id._internalGetInt64Value()
+        let senderAccountId = context.account.peerId.id._internalGetInt64Value()
+
+        // Bot chats and the Telegram Service peer (777000) are never claim-checked.
+        if AIBackgroundTranslationObserver.botChatIds.contains(targetId) || targetId == 777000 {
+            return .single(.allowed)
+        }
+
+        if proxyClient == nil {
+            updateProxyClient()
+        }
+        guard let client = proxyClient else {
+            AILogger.log("CLAIM GUARD: proxyClient nil — allowing send target=\(targetId)")
+            return .single(.networkError)
+        }
+
+        return ConversationContextProvider.hasTwoSidedHistory(chatId: chatId, context: context)
+        |> mapToSignal { hasTwoSided -> Signal<AIClaimGuardResult, NoError> in
+            AILogger.log("CLAIM GUARD START: target=\(targetId) sender=\(senderAccountId) twoSided=\(hasTwoSided)")
+            return client.registerClaim(
+                chatId: targetId,
+                senderAccountId: senderAccountId,
+                hasTwoSidedHistory: hasTwoSided
+            )
+        }
     }
 
     // MARK: - Outgoing Translation (EN → DE)
@@ -174,16 +240,25 @@ public final class AITranslationService {
             contextSignal = .single([])
         }
 
+        // Two-sided history check — bypasses the claim block when an ongoing
+        // conversation already exists in this chat. Runs in parallel with the
+        // context fetch so it adds no sequential latency.
+        let historySignal = ConversationContextProvider.hasTwoSidedHistory(
+            chatId: chatId,
+            context: context
+        )
+
         AILogger.log("OUT START: chat=\(chatIdInt) sender=\(senderAccountId) text='\(textPreview)'")
 
-        return contextSignal
-        |> mapToSignal { contextMessages -> Signal<OutgoingTranslationResult, NoError> in
-            AILogger.log("OUT: context ready (\(contextMessages.count) msgs), firing HTTP...")
+        return combineLatest(contextSignal, historySignal)
+        |> mapToSignal { contextMessages, hasTwoSided -> Signal<OutgoingTranslationResult, NoError> in
+            AILogger.log("OUT: context ready (\(contextMessages.count) msgs) twoSided=\(hasTwoSided), firing HTTP...")
             return client.translateStrictDetailed(
                 text: text,
                 direction: "outgoing",
                 chatId: chatIdInt,
                 senderAccountId: senderAccountId,
+                hasTwoSidedHistory: hasTwoSided,
                 context: contextMessages
             )
             |> mapToSignal { result -> Signal<OutgoingTranslationResult, NoError> in
@@ -192,7 +267,7 @@ public final class AITranslationService {
                     AILogger.log("OUT OK: '\(textPreview)' -> '\(String(translatedText.prefix(40)))'")
                     return .single(.success(translatedText))
                 case .userClaimed:
-                    AILogger.log("OUT CLAIMED: target=\(chatIdInt) sender=\(senderAccountId)")
+                    AILogger.log("OUT CLAIMED: target=\(chatIdInt) sender=\(senderAccountId) twoSided=\(hasTwoSided)")
                     return .single(.userClaimed)
                 case .backendFailure:
                     AILogger.log("OUT E2: backendFailure text='\(textPreview)'")
@@ -209,6 +284,7 @@ public final class AITranslationService {
                         direction: "outgoing",
                         chatId: chatIdInt,
                         senderAccountId: senderAccountId,
+                        hasTwoSidedHistory: hasTwoSided,
                         context: contextMessages
                     )
                     |> map { retryResult -> OutgoingTranslationResult in

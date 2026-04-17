@@ -45,6 +45,21 @@ def patch_notification_reply(filepath: str) -> None:
     new_code = """// AI Translation: translate notification reply before sending
                         let aiReplyToMessageId = replyToMessageId
                         let aiProxyURL = AITranslationSettings.proxyServerURL
+                        // Claim guard (fire-and-forget) — registers the claim for the
+                        // outgoing notification reply regardless of whether translation
+                        // runs below. Uses AIProxyClient directly because notification
+                        // replies only have `account: Account`, not an AccountContext,
+                        // so the Postbox-based two-sided-history check isn't available
+                        // here. Reply-from-banner is an edge case — the main in-app
+                        // paths still run the full applyClaimGuard with history check.
+                        if !aiProxyURL.isEmpty && !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) && peerId.id._internalGetInt64Value() != 777000 {
+                            AILogger.log("OUT-PATH [notification-reply]: peer=\\(peerId.id._internalGetInt64Value())")
+                            let _ = AIProxyClient(baseURL: aiProxyURL).registerClaim(
+                                chatId: peerId.id._internalGetInt64Value(),
+                                senderAccountId: account.peerId.id._internalGetInt64Value(),
+                                hasTwoSidedHistory: false
+                            ).start()
+                        }
                         if AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing && !aiProxyURL.isEmpty && !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) && (AITranslationSettings.enabledChatIds.isEmpty || AITranslationSettings.enabledChatIds.contains(peerId.id._internalGetInt64Value())) {
                             let aiClient = AIProxyClient(baseURL: aiProxyURL)
                             return aiClient.translateStrict(

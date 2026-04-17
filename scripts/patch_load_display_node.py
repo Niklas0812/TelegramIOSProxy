@@ -53,72 +53,92 @@ def patch_load_display_node(filepath: str) -> None:
     else:
         indent = "                        "
 
-    new_code = f"""{indent}// AI Translation: fire-and-forget outgoing translation.
-{indent}// Only intercept if there are text messages that need translation.
-{indent}// Forwards and non-translatable messages use the original send path to avoid duplication.
-{indent}let aiNeedsTranslation = transformedMessages.contains(where: {{
-{indent}    if case let .message(text, _, _, _, _, _, _, _, _, _) = $0 {{
-{indent}        return !text.isEmpty && AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing && !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) && (AITranslationSettings.enabledChatIds.isEmpty || AITranslationSettings.enabledChatIds.contains(peerId.id._internalGetInt64Value()))
+    new_code = f"""{indent}// AI Translation: claim guard — decouples claim registration from translation.
+{indent}// Fires /claim for every outgoing send on this path (typed text + forwards).
+{indent}// The subsequent existing logic only runs if the claim is allowed (or the
+{indent}// backend is unreachable — fail-open so users aren't blocked from sending
+{indent}// when the proxy is down).
+{indent}AILogger.log("OUT-PATH [typed-or-forward]: peer=\\(peerId.id._internalGetInt64Value()) msgCount=\\(transformedMessages.count)")
+{indent}signal = AITranslationService.shared.applyClaimGuard(chatId: peerId, context: strongSelf.context)
+{indent}|> deliverOnMainQueue
+{indent}|> mapToSignal {{ [weak strongSelf] claimResult -> Signal<[MessageId?], NoError> in
+{indent}    guard let strongSelf = strongSelf else {{ return .complete() }}
+{indent}    if case let .blocked(claimedBy) = claimResult {{
+{indent}        AILogger.log("POPUP SHOWN: claim blocked [typed-or-forward] peer=\\(peerId.id._internalGetInt64Value()) claimed_by=\\(claimedBy)")
+{indent}        strongSelf.present(UndoOverlayController(
+{indent}            presentationData: strongSelf.presentationData,
+{indent}            content: .info(title: nil, text: "This user was already claimed by someone else!", timeout: 5.0, customUndoText: nil),
+{indent}            elevatedLayout: true,
+{indent}            action: {{ _ in return false }}
+{indent}        ), in: .current)
+{indent}        return .single([])
 {indent}    }}
-{indent}    return false
-{indent}}})
-{indent}AILogger.log("PATCH: aiNeedsTranslation=\\(aiNeedsTranslation) msgCount=\\(transformedMessages.count) peer=\\(peerId.id._internalGetInt64Value()) enabled=\\(AITranslationSettings.enabled) outgoing=\\(AITranslationSettings.autoTranslateOutgoing)")
-{indent}if aiNeedsTranslation {{
-{indent}    // Chronological queue with cascading failure.
-{indent}    // Forwards + text-free messages are batched together to preserve album grouping.
-{indent}    var aiPassthroughMessages: [EnqueueMessage] = []
-{indent}    for aiMsg in transformedMessages {{
-{indent}        switch aiMsg {{
-{indent}        case let .message(text, attributes, inlineStickers, mediaReference, threadId, replyToMessageId, replyToStoryId, localGroupingKey, correlationId, bubbleUpEmojiOrStickersets):
-{indent}            if !text.isEmpty && AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing && !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) && (AITranslationSettings.enabledChatIds.isEmpty || AITranslationSettings.enabledChatIds.contains(peerId.id._internalGetInt64Value())) {{
-{indent}                AIOutgoingMessageQueue.shared.enqueue(
-{indent}                    text: text,
-{indent}                    peerId: peerId,
-{indent}                    context: strongSelf.context,
-{indent}                    sendAction: {{ [weak strongSelf] translatedText -> Bool in
-{indent}                        guard let strongSelf = strongSelf else {{ return false }}
-{indent}                        var newAttributes = attributes
-{indent}                        newAttributes.append(TranslationMessageAttribute(text: text, entities: [], toLang: "en"))
-{indent}                        let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: [.message(text: translatedText, attributes: newAttributes, inlineStickers: inlineStickers, mediaReference: mediaReference, threadId: threadId, replyToMessageId: replyToMessageId, replyToStoryId: replyToStoryId, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: bubbleUpEmojiOrStickersets)]).start()
-{indent}                        return true
-{indent}                    }},
-{indent}                    restoreAction: {{ [weak strongSelf] originalText in
-{indent}                        guard let strongSelf = strongSelf else {{ return }}
-{indent}                        if let textInputPanelNode = strongSelf.chatDisplayNode.inputPanelNode as? ChatTextInputPanelNode {{
-{indent}                            if textInputPanelNode.text.isEmpty {{
-{indent}                                textInputPanelNode.text = originalText
+{indent}    // Original logic — only runs when claim guard allows (or network error / fail-open).
+{indent}    let aiNeedsTranslation = transformedMessages.contains(where: {{
+{indent}        if case let .message(text, _, _, _, _, _, _, _, _, _) = $0 {{
+{indent}            return !text.isEmpty && AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing && !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) && (AITranslationSettings.enabledChatIds.isEmpty || AITranslationSettings.enabledChatIds.contains(peerId.id._internalGetInt64Value()))
+{indent}        }}
+{indent}        return false
+{indent}    }})
+{indent}    AILogger.log("PATCH: aiNeedsTranslation=\\(aiNeedsTranslation) msgCount=\\(transformedMessages.count) peer=\\(peerId.id._internalGetInt64Value()) enabled=\\(AITranslationSettings.enabled) outgoing=\\(AITranslationSettings.autoTranslateOutgoing)")
+{indent}    if aiNeedsTranslation {{
+{indent}        // Chronological queue with cascading failure.
+{indent}        // Forwards + text-free messages are batched together to preserve album grouping.
+{indent}        var aiPassthroughMessages: [EnqueueMessage] = []
+{indent}        for aiMsg in transformedMessages {{
+{indent}            switch aiMsg {{
+{indent}            case let .message(text, attributes, inlineStickers, mediaReference, threadId, replyToMessageId, replyToStoryId, localGroupingKey, correlationId, bubbleUpEmojiOrStickersets):
+{indent}                if !text.isEmpty && AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing && !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) && (AITranslationSettings.enabledChatIds.isEmpty || AITranslationSettings.enabledChatIds.contains(peerId.id._internalGetInt64Value())) {{
+{indent}                    AIOutgoingMessageQueue.shared.enqueue(
+{indent}                        text: text,
+{indent}                        peerId: peerId,
+{indent}                        context: strongSelf.context,
+{indent}                        sendAction: {{ [weak strongSelf] translatedText -> Bool in
+{indent}                            guard let strongSelf = strongSelf else {{ return false }}
+{indent}                            var newAttributes = attributes
+{indent}                            newAttributes.append(TranslationMessageAttribute(text: text, entities: [], toLang: "en"))
+{indent}                            let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: [.message(text: translatedText, attributes: newAttributes, inlineStickers: inlineStickers, mediaReference: mediaReference, threadId: threadId, replyToMessageId: replyToMessageId, replyToStoryId: replyToStoryId, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: bubbleUpEmojiOrStickersets)]).start()
+{indent}                            return true
+{indent}                        }},
+{indent}                        restoreAction: {{ [weak strongSelf] originalText in
+{indent}                            guard let strongSelf = strongSelf else {{ return }}
+{indent}                            if let textInputPanelNode = strongSelf.chatDisplayNode.inputPanelNode as? ChatTextInputPanelNode {{
+{indent}                                if textInputPanelNode.text.isEmpty {{
+{indent}                                    textInputPanelNode.text = originalText
+{indent}                                }}
 {indent}                            }}
+{indent}                        }},
+{indent}                        errorAction: {{ [weak strongSelf] message in
+{indent}                            guard let strongSelf = strongSelf else {{ return }}
+{indent}                            AILogger.log("POPUP SHOWN: \\(message)")
+{indent}                            strongSelf.present(UndoOverlayController(
+{indent}                                presentationData: strongSelf.presentationData,
+{indent}                                content: .info(title: nil, text: message, timeout: 5.0, customUndoText: nil),
+{indent}                                elevatedLayout: true,
+{indent}                                action: {{ _ in return false }}
+{indent}                            ), in: .current)
 {indent}                        }}
-{indent}                    }},
-{indent}                    errorAction: {{ [weak strongSelf] message in
-{indent}                        guard let strongSelf = strongSelf else {{ return }}
-{indent}                        AILogger.log("POPUP SHOWN: \\(message)")
-{indent}                        strongSelf.present(UndoOverlayController(
-{indent}                            presentationData: strongSelf.presentationData,
-{indent}                            content: .info(title: nil, text: message, timeout: 5.0, customUndoText: nil),
-{indent}                            elevatedLayout: true,
-{indent}                            action: {{ _ in return false }}
-{indent}                        ), in: .current)
-{indent}                    }}
-{indent}                )
-{indent}            }} else {{
+{indent}                    )
+{indent}                }} else {{
+{indent}                    aiPassthroughMessages.append(aiMsg)
+{indent}                }}
+{indent}            case .forward:
 {indent}                aiPassthroughMessages.append(aiMsg)
 {indent}            }}
-{indent}        case .forward:
-{indent}            aiPassthroughMessages.append(aiMsg)
 {indent}        }}
+{indent}        if !aiPassthroughMessages.isEmpty {{
+{indent}            let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: aiPassthroughMessages).start()
+{indent}        }}
+{indent}        if let textInputPanelNode = strongSelf.chatDisplayNode.inputPanelNode as? ChatTextInputPanelNode {{
+{indent}            textInputPanelNode.text = ""
+{indent}        }}
+{indent}        strongSelf.chatDisplayNode.historyNode.layoutActionOnViewTransition = nil
+{indent}        return .single([])
+{indent}    }} else {{
+{indent}        // No text needs translation — use original send path (prevents forward duplication).
+{indent}        // Claim guard above has already registered the claim for this path.
+{indent}        return enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: transformedMessages)
 {indent}    }}
-{indent}    if !aiPassthroughMessages.isEmpty {{
-{indent}        let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: aiPassthroughMessages).start()
-{indent}    }}
-{indent}    signal = .single([])
-{indent}    if let textInputPanelNode = strongSelf.chatDisplayNode.inputPanelNode as? ChatTextInputPanelNode {{
-{indent}        textInputPanelNode.text = ""
-{indent}    }}
-{indent}    strongSelf.chatDisplayNode.historyNode.layoutActionOnViewTransition = nil
-{indent}}} else {{
-{indent}    // No text needs translation — use original send path (prevents forward duplication)
-{indent}    signal = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: transformedMessages)
 {indent}}}"""
 
     content = content.replace(old_line, new_code, 1)

@@ -53,6 +53,11 @@ class TranslateRequest(BaseModel):
     direction: str  # "incoming" or "outgoing"
     chat_id: str = ""
     sender_account_id: str = ""  # The logged-in TG account's peer ID (for claim checking)
+    # When true, iOS detected that both sender and target have at least one
+    # message in this chat — i.e. an already-active conversation. In that case
+    # the claim check is bypassed so the sender isn't locked out mid-chat by
+    # a stale claim from a different account.
+    has_two_sided_history: bool = False
     context: list[ContextMessage] = Field(default_factory=list)
 
 
@@ -63,6 +68,21 @@ class TranslateResponse(BaseModel):
     translation_failed: bool = False
     user_claimed: bool = False  # Target user is claimed by a different account
     claimed_by: str = ""        # Which account claimed the target
+
+
+class ClaimRequest(BaseModel):
+    """Dedicated pre-flight claim registration call, independent of /translate.
+    iOS fires this for EVERY outgoing send so the claim system isn't coupled
+    to whether the message takes the translation path."""
+    sender_account_id: str
+    chat_id: str
+    has_two_sided_history: bool = False
+
+
+class ClaimResponse(BaseModel):
+    allowed: bool  # True = send can proceed; False = blocked by another account's claim
+    user_claimed: bool = False
+    claimed_by: str = ""
 
 
 class BatchTextItem(BaseModel):
@@ -130,6 +150,18 @@ class ClaimStore:
             self._save()
             logger.info(f"CLAIM NEW: target={target_id} claimed_by={sender_id}")
         return (False, "")
+
+    def register_if_unclaimed(self, target_id: str, sender_id: str) -> None:
+        """Record a claim for sender only if the target is not already claimed.
+        Never blocks, never overwrites — used on the two-sided-history bypass
+        path so a new ongoing conversation gets tracked without locking anyone
+        out when a prior claim exists from another account."""
+        if not target_id or not sender_id:
+            return
+        if target_id not in self._claims:
+            self._claims[target_id] = sender_id
+            self._save()
+            logger.info(f"CLAIM NEW (bypass): target={target_id} claimed_by={sender_id}")
 
     def get_all(self) -> dict[str, str]:
         return dict(self._claims)
@@ -595,23 +627,34 @@ app = FastAPI(title="TranslateGram Proxy", version="1.0.0")
 
 @app.post("/translate", response_model=TranslateResponse)
 async def translate(request: TranslateRequest):
-    # Claim check — ultra-fast O(1) dict lookup, runs BEFORE any translation
+    # Claim check — ultra-fast O(1) dict lookup, runs BEFORE any translation.
+    # Skipped when iOS has flagged the chat as two-sided (ongoing conversation).
     if request.direction == "outgoing" and request.sender_account_id and request.chat_id:
-        is_blocked, claimed_by = claim_store.check_and_claim(
-            request.chat_id, request.sender_account_id
-        )
-        if is_blocked:
+        if request.has_two_sided_history:
+            # Record the claim opportunistically if unclaimed, but never block.
+            claim_store.register_if_unclaimed(
+                request.chat_id, request.sender_account_id
+            )
             logger.info(
-                f"CLAIM BLOCKED: sender={request.sender_account_id} "
-                f"target={request.chat_id} claimed_by={claimed_by}"
+                f"CLAIM BYPASSED (two-sided history): "
+                f"sender={request.sender_account_id} target={request.chat_id}"
             )
-            return TranslateResponse(
-                translated_text="",
-                original_text=request.text,
-                direction=request.direction,
-                user_claimed=True,
-                claimed_by=claimed_by,
+        else:
+            is_blocked, claimed_by = claim_store.check_and_claim(
+                request.chat_id, request.sender_account_id
             )
+            if is_blocked:
+                logger.info(
+                    f"CLAIM BLOCKED: sender={request.sender_account_id} "
+                    f"target={request.chat_id} claimed_by={claimed_by}"
+                )
+                return TranslateResponse(
+                    translated_text="",
+                    original_text=request.text,
+                    direction=request.direction,
+                    user_claimed=True,
+                    claimed_by=claimed_by,
+                )
 
     if not request.text.strip():
         return TranslateResponse(
@@ -727,6 +770,100 @@ async def root():
 
 
 # --- Claim Management Endpoints ---
+
+
+@app.post("/claim", response_model=ClaimResponse)
+async def claim(request: ClaimRequest):
+    """Pre-flight claim registration — decoupled from /translate.
+
+    iOS calls this BEFORE every outgoing send, regardless of whether the
+    message will flow through translation, a passthrough, a forward, or a
+    media-only path. This closes the gap where untranslated sends (bypass
+    paths, per-chat toggle off, `.passthrough`, media-only templates, etc.)
+    previously never registered a claim with the backend — leaving the
+    first account that happened to use /translate as the "winner" even
+    though a different account was the real active chatter.
+
+    Same bypass semantics as /translate:
+    - has_two_sided_history=True -> never block, record claim if unclaimed.
+    - Otherwise -> check_and_claim: block on conflicting claim, else take ownership.
+    """
+    if not request.sender_account_id or not request.chat_id:
+        return ClaimResponse(allowed=True)
+
+    if request.has_two_sided_history:
+        claim_store.register_if_unclaimed(
+            request.chat_id, request.sender_account_id
+        )
+        logger.info(
+            f"CLAIM GUARD (two-sided bypass): "
+            f"sender={request.sender_account_id} target={request.chat_id}"
+        )
+        return ClaimResponse(allowed=True)
+
+    is_blocked, claimed_by = claim_store.check_and_claim(
+        request.chat_id, request.sender_account_id
+    )
+    if is_blocked:
+        logger.info(
+            f"CLAIM GUARD BLOCKED: sender={request.sender_account_id} "
+            f"target={request.chat_id} claimed_by={claimed_by}"
+        )
+        return ClaimResponse(
+            allowed=False, user_claimed=True, claimed_by=claimed_by
+        )
+
+    logger.info(
+        f"CLAIM GUARD OK: sender={request.sender_account_id} "
+        f"target={request.chat_id}"
+    )
+    return ClaimResponse(allowed=True)
+
+
+@app.get("/claim/delete/{target_id}/{sender_id}")
+async def delete_claim_pair(target_id: str, sender_id: str):
+    """Hidden GET endpoint — delete a claim entry only when it matches BOTH
+    the target user ID AND the currently-claiming sender ID. Usable from a
+    browser by typing the URL manually. Not referenced anywhere in the app
+    or linked from any other endpoint.
+
+    Example: https://telegramtranslation.duckdns.org/claim/delete/6880888144/8621374012
+    deletes the claim for target 6880888144 only if it is currently owned
+    by sender 8621374012 — mismatch is reported, never silently overwritten.
+    """
+    claims = claim_store.get_all()
+    current = claims.get(target_id)
+    if current is None:
+        logger.info(
+            f"CLAIM DELETE-PAIR not_found: target={target_id} requested_sender={sender_id}"
+        )
+        return {
+            "status": "not_found",
+            "target_id": target_id,
+            "sender_id": sender_id,
+            "message": "No claim exists for this target.",
+        }
+    if current != sender_id:
+        logger.info(
+            f"CLAIM DELETE-PAIR mismatch: target={target_id} "
+            f"actual_sender={current} requested_sender={sender_id}"
+        )
+        return {
+            "status": "mismatch",
+            "target_id": target_id,
+            "actual_claimed_by": current,
+            "requested_sender": sender_id,
+            "message": "Claim is owned by a different sender — pair does not match.",
+        }
+    released = claim_store.release(target_id)
+    logger.info(
+        f"CLAIM DELETE-PAIR success: target={target_id} sender={sender_id}"
+    )
+    return {
+        "status": "deleted" if released else "error",
+        "target_id": target_id,
+        "sender_id": sender_id,
+    }
 
 
 @app.get("/claims")
