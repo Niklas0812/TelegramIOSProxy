@@ -483,7 +483,7 @@ public func aiSettingsController(context: AccountContext) -> ViewController {
             )
             alert.addTextField { textField in
                 textField.text = currentURL
-                textField.placeholder = "https://telegramtranslation.duckdns.org"
+                textField.placeholder = "https://telegramtranslation2.duckdns.org"
                 textField.keyboardType = .URL
                 textField.autocapitalizationType = .none
                 textField.autocorrectionType = .no
