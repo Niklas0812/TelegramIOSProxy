@@ -50,15 +50,16 @@ def patch_chat_controller(filepath: str) -> None:
 
     func_header = match.group(0)
 
-    # Inject the translation guard right after the opening brace
+    # Inject the translation guard right after the opening brace.
+    # Design: EVERY sendMessages call (regardless of content kind) is routed
+    # through AIOutgoingMessageQueue, so duplicate-pending sends are blocked
+    # and per-peer FIFO order is preserved across media and text paths. The
+    # native sendMessages body is only executed if we can't resolve a peerId
+    # (should not happen in practice).
     translation_guard = """
-        // AI Translation: claim guard (fire-and-forget) — decouples claim registration
-        // from translation. Fires /claim for every outgoing message that reaches
-        // sendMessages(), so media-only sends, forwards, and translation-disabled
-        // chats still register the sender's claim on the target. Fire-and-forget:
-        // we don't block the sync send flow on the HTTP round-trip. Enforcement for
-        // this path continues to happen via the translateOutgoingStrict call below
-        // when translation applies.
+        // AI Translation: media caption translation guard
+        // Claim guard (fire-and-forget) stays here — registers the claim on the
+        // target regardless of whether the batch is translated or passthrough.
         if let aiClaimPeerId = self.chatLocation.peerId,
            !AIBackgroundTranslationObserver.botChatIds.contains(aiClaimPeerId.id._internalGetInt64Value()),
            aiClaimPeerId.id._internalGetInt64Value() != 777000 {
@@ -66,16 +67,10 @@ def patch_chat_controller(filepath: str) -> None:
             let _ = AITranslationService.shared.applyClaimGuard(chatId: aiClaimPeerId, context: self.context).start()
         }
 
-        // AI Translation: media caption translation guard
-        // Translates caption text, then enqueues ENTIRE batch directly to preserve album grouping
-        // and TranslationMessageAttribute (same path as compose bar text).
-        if AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing,
-           let aiPeerId = self.chatLocation.peerId,
-           !AIBackgroundTranslationObserver.botChatIds.contains(aiPeerId.id._internalGetInt64Value()),
-           AITranslationSettings.enabledChatIds.isEmpty || AITranslationSettings.enabledChatIds.contains(aiPeerId.id._internalGetInt64Value()) {
-
-            // Re-entry check: if any message already has TranslationMessageAttribute,
-            // this batch was already translated — skip to normal send
+        if let aiSendPeerId = self.chatLocation.peerId {
+            // Re-entry guard: if a message in this batch already carries a
+            // TranslationMessageAttribute, a previous invocation of the queue's
+            // sendAction built it — treat as passthrough to avoid re-translating.
             let aiAlreadyTranslated = messages.contains(where: {
                 if case let .message(_, attributes, _, _, _, _, _, _, _, _) = $0 {
                     return attributes.contains(where: { $0 is TranslationMessageAttribute })
@@ -83,80 +78,91 @@ def patch_chat_controller(filepath: str) -> None:
                 return false
             })
 
-            if !aiAlreadyTranslated {
-                // Find first message with untranslated caption text
-                var aiCaptionIndex: Int? = nil
+            let aiShouldTranslate = !aiAlreadyTranslated
+                && AITranslationSettings.enabled
+                && AITranslationSettings.autoTranslateOutgoing
+                && !AIBackgroundTranslationObserver.botChatIds.contains(aiSendPeerId.id._internalGetInt64Value())
+                && (AITranslationSettings.enabledChatIds.isEmpty || AITranslationSettings.enabledChatIds.contains(aiSendPeerId.id._internalGetInt64Value()))
+
+            // Find first caption-bearing message in the batch (if any).
+            var aiCaptionIdx: Int? = nil
+            if aiShouldTranslate {
                 for (aiIdx, aiMsg) in messages.enumerated() {
-                    if case let .message(text, _, _, _, _, _, _, _, _, _) = aiMsg,
-                       !text.isEmpty {
-                        aiCaptionIndex = aiIdx
+                    if case let .message(text, _, _, _, _, _, _, _, _, _) = aiMsg, !text.isEmpty {
+                        aiCaptionIdx = aiIdx
                         break
                     }
                 }
+            }
 
-                if let aiCaptionIdx = aiCaptionIndex {
-                    guard case let .message(aiCaptionText, _, _, _, _, _, _, _, _, _) = messages[aiCaptionIdx] else { return }
+            let aiBatchFp = SendFingerprint.buildBatch(peerId: aiSendPeerId, messages: messages)
+            let aiBatchRef = messages
 
-                    let aiOriginalMessages = messages
-                    let aiTranslationDisposable = MetaDisposable()
-                    var aiTranslationCompleted = false
-
-                    let aiSignal = AITranslationService.shared.translateOutgoingStrict(
-                        text: aiCaptionText,
-                        chatId: aiPeerId,
-                        context: self.context
-                    ) |> deliverOnMainQueue
-
-                    aiTranslationDisposable.set(aiSignal.start(next: { [weak self] outcome in
-                        guard let self = self, !aiTranslationCompleted else { return }
-                        aiTranslationCompleted = true
-
-                        switch outcome {
-                        case .success(let translatedText), .passthrough(let translatedText):
-                            var newMessages = aiOriginalMessages
-                            if case let .message(text, attributes, inlineStickers, mediaReference, threadId, replyToMessageId, replyToStoryId, localGroupingKey, correlationId, bubbleUpEmojiOrStickersets) = aiOriginalMessages[aiCaptionIdx] {
-                                var newAttributes = attributes
-                                newAttributes.append(TranslationMessageAttribute(text: text, entities: [], toLang: "en"))
-                                newMessages[aiCaptionIdx] = .message(text: translatedText, attributes: newAttributes, inlineStickers: inlineStickers, mediaReference: mediaReference, threadId: threadId, replyToMessageId: replyToMessageId, replyToStoryId: replyToStoryId, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: bubbleUpEmojiOrStickersets)
-                            }
-                            AIBackgroundTranslationObserver.pendingCaptionOriginals["\\(aiPeerId.id._internalGetInt64Value())_\\(translatedText)"] = aiCaptionText
-                            let _ = enqueueMessages(account: self.context.account, peerId: aiPeerId, messages: newMessages).start()
-                        case .userClaimed:
-                            AILogger.log("POPUP SHOWN: caption — user claimed")
-                            self.present(UndoOverlayController(
-                                presentationData: self.presentationData,
-                                content: .info(title: nil, text: "This user was already claimed by someone else!", timeout: 5.0, customUndoText: nil),
-                                elevatedLayout: true,
-                                action: { _ in return false }
-                            ), in: .current)
-                        case .translationFailed:
-                            AILogger.log("POPUP SHOWN: caption translation failed")
-                            self.present(UndoOverlayController(
-                                presentationData: self.presentationData,
-                                content: .info(title: nil, text: "Translation failed. Message not sent. Try again.", timeout: 5.0, customUndoText: nil),
-                                elevatedLayout: true,
-                                action: { _ in return false }
-                            ), in: .current)
+            if let aiCaptionIdxLet = aiCaptionIdx,
+               case let .message(aiCaptionText, _, _, _, _, _, _, _, _, _) = messages[aiCaptionIdxLet], !aiCaptionText.isEmpty {
+                // TRANSLATION PATH — queue handles translation + dedup + FIFO.
+                // When translation completes, sendAction rebuilds the batch with
+                // the translated caption + TranslationMessageAttribute, then calls
+                // enqueueMessages directly (same as before, just via the queue).
+                let aiCaptionIdxFinal = aiCaptionIdxLet
+                let _ = AIOutgoingMessageQueue.shared.enqueue(
+                    peerId: aiSendPeerId,
+                    fingerprint: aiBatchFp,
+                    kind: .translate(text: aiCaptionText),
+                    context: self.context,
+                    sendAction: { [weak self] translatedText -> Bool in
+                        guard let self = self else { return false }
+                        var newMessages = aiBatchRef
+                        if case let .message(origText, attributes, inlineStickers, mediaReference, threadId, replyToMessageId, replyToStoryId, localGroupingKey, correlationId, bubbleUpEmojiOrStickersets) = aiBatchRef[aiCaptionIdxFinal] {
+                            var newAttributes = attributes
+                            newAttributes.append(TranslationMessageAttribute(text: origText, entities: [], toLang: "en"))
+                            newMessages[aiCaptionIdxFinal] = .message(text: translatedText, attributes: newAttributes, inlineStickers: inlineStickers, mediaReference: mediaReference, threadId: threadId, replyToMessageId: replyToMessageId, replyToStoryId: replyToStoryId, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: bubbleUpEmojiOrStickersets)
                         }
-                    }))
-
-                    // Failsafe timeout
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 60.0) { [weak self] in
-                        guard !aiTranslationCompleted, let self = self else { return }
-                        aiTranslationCompleted = true
-                        aiTranslationDisposable.dispose()
-                        AILogger.log("POPUP SHOWN: caption 60s TIMEOUT")
+                        AIBackgroundTranslationObserver.pendingCaptionOriginals["\\(aiSendPeerId.id._internalGetInt64Value())_\\(translatedText)"] = aiCaptionText
+                        let _ = enqueueMessages(account: self.context.account, peerId: aiSendPeerId, messages: newMessages).start()
+                        return true
+                    },
+                    restoreAction: { _ in },
+                    errorAction: { [weak self] message in
+                        guard let self = self else { return }
+                        AILogger.log("POPUP SHOWN: caption — \\(message)")
                         self.present(UndoOverlayController(
                             presentationData: self.presentationData,
-                            content: .info(title: nil, text: "Translation timed out. Message not sent. Try again.", timeout: 5.0, customUndoText: nil),
+                            content: .info(title: nil, text: message, timeout: 5.0, customUndoText: nil),
                             elevatedLayout: true,
                             action: { _ in return false }
                         ), in: .current)
                     }
-
-                    return
-                }
+                )
+                return
             }
+
+            // PASSTHROUGH PATH — already-translated batch, bot chat, excluded
+            // chat, pure forward, or media-only send. Queue as .passthrough so
+            // it still takes its FIFO turn behind any earlier translating messages.
+            let _ = AIOutgoingMessageQueue.shared.enqueue(
+                peerId: aiSendPeerId,
+                fingerprint: aiBatchFp,
+                kind: .passthrough(text: ""),
+                context: self.context,
+                sendAction: { [weak self] _ -> Bool in
+                    guard let self = self else { return false }
+                    let _ = enqueueMessages(account: self.context.account, peerId: aiSendPeerId, messages: aiBatchRef).start()
+                    return true
+                },
+                restoreAction: { _ in },
+                errorAction: { [weak self] message in
+                    guard let self = self else { return }
+                    AILogger.log("POPUP SHOWN: chat-ctrl-passthrough — \\(message)")
+                    self.present(UndoOverlayController(
+                        presentationData: self.presentationData,
+                        content: .info(title: nil, text: message, timeout: 5.0, customUndoText: nil),
+                        elevatedLayout: true,
+                        action: { _ in return false }
+                    ), in: .current)
+                }
+            )
+            return
         }
 """
 

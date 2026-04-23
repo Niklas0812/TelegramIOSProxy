@@ -91,16 +91,49 @@ def patch_quick_reply(filepath: str) -> None:
                     let mediaRef: AnyMediaReference? = msg.media.first.flatMap { AnyMediaReference.standalone(media: $0) }
                     let cachedEnglish = AIBackgroundTranslationObserver.quickReplyTranslations[msg.id]
 
-                    // Case: media-only template — no caption to translate, send directly.
+                    // Case: media-only template — no caption to translate. Route
+                    // through the queue as .passthrough so it still takes its FIFO
+                    // turn behind any earlier text template translations.
                     if storedText.isEmpty {
                         AILogger.log("QR-SEND MEDIA-ONLY: msg=\\(msg.id.id) peer=\\(peerId.id._internalGetInt64Value()) hasMedia=\\(mediaRef != nil)")
-                        let _ = enqueueMessages(account: self.context.account, peerId: peerId, messages: [
-                            .message(text: "", attributes: [], inlineStickers: [:],
-                                     mediaReference: mediaRef, threadId: threadId,
-                                     replyToMessageId: nil, replyToStoryId: nil,
-                                     localGroupingKey: nil, correlationId: nil,
-                                     bubbleUpEmojiOrStickersets: [])
-                        ]).start()
+                        let qrMediaFp = SendFingerprint.build(
+                            peerId: peerId,
+                            text: "",
+                            media: mediaRef?.media,
+                            replyToMessageId: nil,
+                            replyToStoryId: nil,
+                            localGroupingKey: nil
+                        )
+                        let qrMediaRef = mediaRef
+                        let qrThreadId = threadId
+                        let _ = AIOutgoingMessageQueue.shared.enqueue(
+                            peerId: peerId,
+                            fingerprint: qrMediaFp,
+                            kind: .passthrough(text: ""),
+                            context: self.context,
+                            sendAction: { [weak self] _ -> Bool in
+                                guard let self = self else { return false }
+                                let _ = enqueueMessages(account: self.context.account, peerId: peerId, messages: [
+                                    .message(text: "", attributes: [], inlineStickers: [:],
+                                             mediaReference: qrMediaRef, threadId: qrThreadId,
+                                             replyToMessageId: nil, replyToStoryId: nil,
+                                             localGroupingKey: nil, correlationId: nil,
+                                             bubbleUpEmojiOrStickersets: [])
+                                ]).start()
+                                return true
+                            },
+                            restoreAction: { _ in },
+                            errorAction: { [weak self] message in
+                                guard let self = self else { return }
+                                AILogger.log("POPUP SHOWN: quick reply media-only — \\(message)")
+                                self.present(UndoOverlayController(
+                                    presentationData: self.presentationData,
+                                    content: .info(title: nil, text: message, timeout: 5.0, customUndoText: nil),
+                                    elevatedLayout: true,
+                                    action: { _ in return false }
+                                ), in: .current)
+                            }
+                        )
                         continue
                     }
 
@@ -114,9 +147,20 @@ def patch_quick_reply(filepath: str) -> None:
                     let sourceText = (cachedEnglish?.isEmpty == false) ? cachedEnglish! : storedText
                     let sourceLabel = (cachedEnglish?.isEmpty == false) ? "cache" : "stored"
                     AILogger.log("QR-SEND QUEUE: enqueue msg=\\(msg.id.id) peer=\\(peerId.id._internalGetInt64Value()) hasMedia=\\(mediaRef != nil) src=\\(sourceLabel) text='\\(String(sourceText.prefix(40)))'")
-                    AIOutgoingMessageQueue.shared.enqueue(
-                        text: sourceText,
+                    let qrTextFp = SendFingerprint.build(
                         peerId: peerId,
+                        text: sourceText,
+                        media: mediaRef?.media,
+                        replyToMessageId: nil,
+                        replyToStoryId: nil,
+                        localGroupingKey: nil
+                    )
+                    let qrTextMediaRef = mediaRef
+                    let qrTextThreadId = threadId
+                    let _ = AIOutgoingMessageQueue.shared.enqueue(
+                        peerId: peerId,
+                        fingerprint: qrTextFp,
+                        kind: .translate(text: sourceText),
                         context: self.context,
                         sendAction: { [weak self] translatedText -> Bool in
                             guard let self = self else { return false }
@@ -125,7 +169,7 @@ def patch_quick_reply(filepath: str) -> None:
                             ]
                             let _ = enqueueMessages(account: self.context.account, peerId: peerId, messages: [
                                 .message(text: translatedText, attributes: attrs, inlineStickers: [:],
-                                         mediaReference: mediaRef, threadId: threadId,
+                                         mediaReference: qrTextMediaRef, threadId: qrTextThreadId,
                                          replyToMessageId: nil, replyToStoryId: nil,
                                          localGroupingKey: nil, correlationId: nil,
                                          bubbleUpEmojiOrStickersets: [])

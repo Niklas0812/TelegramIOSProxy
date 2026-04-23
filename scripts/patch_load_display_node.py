@@ -89,9 +89,18 @@ def patch_load_display_node(filepath: str) -> None:
 {indent}            switch aiMsg {{
 {indent}            case let .message(text, attributes, inlineStickers, mediaReference, threadId, replyToMessageId, replyToStoryId, localGroupingKey, correlationId, bubbleUpEmojiOrStickersets):
 {indent}                if !text.isEmpty && AITranslationSettings.enabled && AITranslationSettings.autoTranslateOutgoing && !AIBackgroundTranslationObserver.botChatIds.contains(peerId.id._internalGetInt64Value()) && (AITranslationSettings.enabledChatIds.isEmpty || AITranslationSettings.enabledChatIds.contains(peerId.id._internalGetInt64Value())) {{
-{indent}                    AIOutgoingMessageQueue.shared.enqueue(
-{indent}                        text: text,
+{indent}                    let aiItemFp = SendFingerprint.build(
 {indent}                        peerId: peerId,
+{indent}                        text: text,
+{indent}                        media: mediaReference?.media,
+{indent}                        replyToMessageId: replyToMessageId,
+{indent}                        replyToStoryId: replyToStoryId,
+{indent}                        localGroupingKey: localGroupingKey
+{indent}                    )
+{indent}                    let _ = AIOutgoingMessageQueue.shared.enqueue(
+{indent}                        peerId: peerId,
+{indent}                        fingerprint: aiItemFp,
+{indent}                        kind: .translate(text: text),
 {indent}                        context: strongSelf.context,
 {indent}                        sendAction: {{ [weak strongSelf] translatedText -> Bool in
 {indent}                            guard let strongSelf = strongSelf else {{ return false }}
@@ -127,7 +136,30 @@ def patch_load_display_node(filepath: str) -> None:
 {indent}            }}
 {indent}        }}
 {indent}        if !aiPassthroughMessages.isEmpty {{
-{indent}            let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: aiPassthroughMessages).start()
+{indent}            let aiPassFp = SendFingerprint.buildBatch(peerId: peerId, messages: aiPassthroughMessages)
+{indent}            let aiPassMessages = aiPassthroughMessages
+{indent}            let _ = AIOutgoingMessageQueue.shared.enqueue(
+{indent}                peerId: peerId,
+{indent}                fingerprint: aiPassFp,
+{indent}                kind: .passthrough(text: ""),
+{indent}                context: strongSelf.context,
+{indent}                sendAction: {{ [weak strongSelf] _ -> Bool in
+{indent}                    guard let strongSelf = strongSelf else {{ return false }}
+{indent}                    let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: aiPassMessages).start()
+{indent}                    return true
+{indent}                }},
+{indent}                restoreAction: {{ _ in }},
+{indent}                errorAction: {{ [weak strongSelf] message in
+{indent}                    guard let strongSelf = strongSelf else {{ return }}
+{indent}                    AILogger.log("POPUP SHOWN: passthrough-batch — \\(message)")
+{indent}                    strongSelf.present(UndoOverlayController(
+{indent}                        presentationData: strongSelf.presentationData,
+{indent}                        content: .info(title: nil, text: message, timeout: 5.0, customUndoText: nil),
+{indent}                        elevatedLayout: true,
+{indent}                        action: {{ _ in return false }}
+{indent}                    ), in: .current)
+{indent}                }}
+{indent}            )
 {indent}        }}
 {indent}        if let textInputPanelNode = strongSelf.chatDisplayNode.inputPanelNode as? ChatTextInputPanelNode {{
 {indent}            textInputPanelNode.text = ""
@@ -135,9 +167,34 @@ def patch_load_display_node(filepath: str) -> None:
 {indent}        strongSelf.chatDisplayNode.historyNode.layoutActionOnViewTransition = nil
 {indent}        return .single([])
 {indent}    }} else {{
-{indent}        // No text needs translation — use original send path (prevents forward duplication).
-{indent}        // Claim guard above has already registered the claim for this path.
-{indent}        return enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: transformedMessages)
+{indent}        // No text needs translation — route the whole batch through the queue
+{indent}        // as passthrough so it still takes its FIFO turn behind any earlier
+{indent}        // translating messages for the same peer. Claim guard already fired.
+{indent}        let aiElseFp = SendFingerprint.buildBatch(peerId: peerId, messages: transformedMessages)
+{indent}        let aiElseMessages = transformedMessages
+{indent}        let _ = AIOutgoingMessageQueue.shared.enqueue(
+{indent}            peerId: peerId,
+{indent}            fingerprint: aiElseFp,
+{indent}            kind: .passthrough(text: ""),
+{indent}            context: strongSelf.context,
+{indent}            sendAction: {{ [weak strongSelf] _ -> Bool in
+{indent}                guard let strongSelf = strongSelf else {{ return false }}
+{indent}                let _ = enqueueMessages(account: strongSelf.context.account, peerId: peerId, messages: aiElseMessages).start()
+{indent}                return true
+{indent}            }},
+{indent}            restoreAction: {{ _ in }},
+{indent}            errorAction: {{ [weak strongSelf] message in
+{indent}                guard let strongSelf = strongSelf else {{ return }}
+{indent}                AILogger.log("POPUP SHOWN: no-translate — \\(message)")
+{indent}                strongSelf.present(UndoOverlayController(
+{indent}                    presentationData: strongSelf.presentationData,
+{indent}                    content: .info(title: nil, text: message, timeout: 5.0, customUndoText: nil),
+{indent}                    elevatedLayout: true,
+{indent}                    action: {{ _ in return false }}
+{indent}                ), in: .current)
+{indent}            }}
+{indent}        )
+{indent}        return .single([])
 {indent}    }}
 {indent}}}"""
 
