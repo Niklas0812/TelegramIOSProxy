@@ -288,6 +288,21 @@ else
     find "$TARGET_DIR" -path "*Telegram-iOS/Info.plist" -not -path "*/build/*" 2>/dev/null | head -3
 fi
 
+# 23.6 Clear SiriIntents IntentsSupported list to silence validator 90626
+# ("No example phrase was provided for INxxxIntent in <lang>"). Telegram ships
+# per-locale Intents.strings but not every (intent, locale) pair has phrases.
+echo "  [23.6/24] Clearing SiriIntents IntentsSupported to silence validator 90626..."
+# The extension plist lives at Telegram/SiriIntents/Info.plist in the Telegram-iOS tree.
+for candidate in \
+    "${TARGET_DIR}/Telegram/SiriIntents/Info.plist" \
+    "${TARGET_DIR}/Telegram/SiriIntents/IntentsInfo.plist" \
+    "${TARGET_DIR}/Telegram/Intents/Info.plist"; do
+    if [ -f "$candidate" ]; then
+        python3 "${SCRIPT_DIR}/patch_intents_plist.py" "$candidate"
+        break
+    fi
+done
+
 # 24. Apply any additional .patch files
 echo "  [24/24] Applying additional patch files..."
 PATCH_COUNT=0
