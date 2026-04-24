@@ -276,7 +276,19 @@ else
     echo "    Done."
 fi
 
-# 23. Apply any additional .patch files
+# 23.5 Patch main app Info.plist to add NSLocationAlwaysAndWhenInUseUsageDescription.
+# Apple validator error 90683 flags this as missing for iOS 11+ apps that reference
+# "always" location APIs, and iOS refuses to install such TestFlight builds.
+echo "  [23.5/24] Patching Telegram-iOS Info.plist for iOS 11+ location purpose string..."
+MAIN_INFO_PLIST="${TARGET_DIR}/Telegram/Telegram-iOS/Info.plist"
+if [ -f "$MAIN_INFO_PLIST" ]; then
+    python3 "${SCRIPT_DIR}/patch_info_plist.py" "$MAIN_INFO_PLIST"
+else
+    echo "    WARNING: $MAIN_INFO_PLIST not found. Searching for alternates..."
+    find "$TARGET_DIR" -path "*Telegram-iOS/Info.plist" -not -path "*/build/*" 2>/dev/null | head -3
+fi
+
+# 24. Apply any additional .patch files
 echo "  [24/24] Applying additional patch files..."
 PATCH_COUNT=0
 for patch_file in "${PATCHES_DIR}"/*.patch; do
