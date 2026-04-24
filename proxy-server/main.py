@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -320,9 +321,51 @@ class TranslationService:
         return {}
 
     def _save_translation_cache(self) -> None:
-        tmp = self.CACHE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._translation_cache, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.CACHE_PATH)
+        """Atomically persist the translation cache to disk.
+
+        Failure modes this hardens against (observed on the Windows VPS):
+
+        * Two concurrent callers racing on the shared `translation_cache.tmp`
+          filename — one's `os.replace()` then fails because the other's open
+          handle is still mid-flush. Fix: per-call UUID tmp filename.
+        * Transient `PermissionError` when Windows Defender / search indexer
+          / any other process holds a brief lock on the target file while we
+          try to `os.replace()` onto it. Fix: retry with short backoff.
+        * Any uncaught exception here used to propagate up to `translate()`
+          and skip its `self._inflight.pop(cache_key)` cleanup — orphaning
+          the in-flight Future so every subsequent duplicate-text request for
+          that cache key awaited it forever. This was the root cause of the
+          backend going unresponsive every few hours. Fix: swallow/log
+          everything; a missed save is harmless (the in-memory cache is still
+          current and will persist on the next successful save).
+        """
+        tmp_path = self.CACHE_PATH.with_suffix(f".{uuid.uuid4().hex}.tmp")
+        try:
+            tmp_path.write_text(
+                json.dumps(self._translation_cache, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            for attempt in range(5):
+                try:
+                    tmp_path.replace(self.CACHE_PATH)
+                    return
+                except PermissionError as e:
+                    if attempt == 4:
+                        logger.warning(
+                            f"cache save PermissionError after 5 retries: {e}"
+                        )
+                        break
+                    time.sleep(0.05 * (attempt + 1))
+        except Exception as e:
+            logger.warning(f"cache save failed: {type(e).__name__}: {e}")
+        finally:
+            # Tidy up the tmp file if it survived (retries exhausted or the
+            # write itself raised after the file was created).
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
 
     def _load_prompts(self) -> None:
         """Load all system prompts from disk into memory cache."""
@@ -523,54 +566,70 @@ class TranslationService:
         future: asyncio.Future = loop.create_future()
         self._inflight[cache_key] = future
 
-        start_time = time.time()
-
-        system_prompt = self._read_system_prompt(request.direction)
-        messages = self._build_messages(
-            request.text, request.direction, request.context, system_prompt
+        # If we end up calling future.set_exception(...) and no concurrent waiter
+        # has attached yet (or ever attaches), asyncio emits a noisy "Future
+        # exception was never retrieved" warning on GC. Consume it proactively.
+        future.add_done_callback(
+            lambda f: (f.cancelled() or f.exception())
         )
 
+        start_time = time.time()
         translated_text = None
         translation_failed = False
 
         try:
-            translated_text = await self._retry_translate(
-                messages,
-                chat_id=request.chat_id,
-                direction=request.direction,
-                original_text=request.text,
+            system_prompt = self._read_system_prompt(request.direction)
+            messages = self._build_messages(
+                request.text, request.direction, request.context, system_prompt
             )
-        except TranslationExhaustedError:
-            logger.error(
-                f"EXHAUSTED chat_id={request.chat_id} "
-                f"direction={request.direction} text_len={len(request.text)}"
-            )
-            translated_text = request.text
-            translation_failed = True
-            self.stats["failed"] += 1
-            self.stats["fallbacks"] += 1
 
-        elapsed_ms = (time.time() - start_time) * 1000
-        self.stats["total_response_time_ms"] += elapsed_ms
+            try:
+                translated_text = await self._retry_translate(
+                    messages,
+                    chat_id=request.chat_id,
+                    direction=request.direction,
+                    original_text=request.text,
+                )
+            except TranslationExhaustedError:
+                logger.error(
+                    f"EXHAUSTED chat_id={request.chat_id} "
+                    f"direction={request.direction} text_len={len(request.text)}"
+                )
+                translated_text = request.text
+                translation_failed = True
+                self.stats["failed"] += 1
+                self.stats["fallbacks"] += 1
 
-        if not translation_failed:
-            self.stats["successful"] += 1
-            self.last_successful_translation = time.time()
-            # Store in persistent cache (skip identity translations where input == output)
-            if translated_text != request.text:
-                self._translation_cache[cache_key] = translated_text
-                self._save_translation_cache()
-            # Share result with any waiters on the in-flight future.
+            elapsed_ms = (time.time() - start_time) * 1000
+            self.stats["total_response_time_ms"] += elapsed_ms
+
+            if not translation_failed:
+                self.stats["successful"] += 1
+                self.last_successful_translation = time.time()
+                # Store in persistent cache (skip identity translations where input == output)
+                if translated_text != request.text:
+                    self._translation_cache[cache_key] = translated_text
+                    self._save_translation_cache()
+                # Share result with any waiters on the in-flight future.
+                if not future.done():
+                    future.set_result(translated_text)
+            else:
+                # Signal exhaustion so waiters fall through to their own attempt.
+                if not future.done():
+                    future.set_exception(RuntimeError("translation exhausted"))
+        finally:
+            # CRITICAL: always drop the in-flight slot — previously a
+            # PermissionError from _save_translation_cache() would escape here
+            # before this line ran, leaving an orphaned Future that blocked
+            # every duplicate-text request for that cache_key indefinitely.
+            # Over hours those stuck awaits starved the event loop until the
+            # backend was unresponsive.
+            self._inflight.pop(cache_key, None)
+            # Defensive: if something escaped before the future got a result
+            # or exception, cancel it so any waiters wake up immediately
+            # instead of hanging forever.
             if not future.done():
-                future.set_result(translated_text)
-        else:
-            # Signal exhaustion so waiters fall through to their own attempt.
-            if not future.done():
-                future.set_exception(RuntimeError("translation exhausted"))
-
-        # Clear in-flight slot last so new duplicates get the cached value instead
-        # of attaching to a resolved future.
-        self._inflight.pop(cache_key, None)
+                future.cancel()
 
         logger.info(
             f"chat_id={request.chat_id} dir={request.direction} "
