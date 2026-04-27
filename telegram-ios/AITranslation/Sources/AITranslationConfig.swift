@@ -63,9 +63,27 @@ public struct AITranslationSettings {
     @AIStorage(key: "ai_translation:enabled", defaultValue: false)
     public static var enabled: Bool
 
-    // Proxy server URL
-    @AIStorage(key: "ai_translation:proxy_url", defaultValue: "https://telegramtranslation2.duckdns.org")
-    public static var proxyServerURL: String
+    // Proxy server URL — with silent migration from legacy DuckDNS hostname.
+    // Existing TestFlight users have "https://telegramtranslation2.duckdns.org"
+    // persisted; on first read after upgrade we promote them to the new
+    // Cloudflare-fronted domain. Users with custom URLs (tunnels etc.) are
+    // untouched.
+    @AIStorage(key: "ai_translation:proxy_url", defaultValue: "https://api.telegramtranslate.de")
+    private static var _proxyServerURL: String
+
+    public static var proxyServerURL: String {
+        get {
+            let stored = _proxyServerURL
+            if stored == "https://telegramtranslation2.duckdns.org" {
+                _proxyServerURL = "https://api.telegramtranslate.de"
+                return "https://api.telegramtranslate.de"
+            }
+            return stored
+        }
+        set {
+            _proxyServerURL = newValue
+        }
+    }
 
     // Per-chat enabled chat IDs
     @AIStorage(key: "ai_translation:enabled_chat_ids", defaultValue: [])
