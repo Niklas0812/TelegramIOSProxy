@@ -110,7 +110,12 @@ def patch_build_file(filepath: str) -> None:
             print("  ✗  FATAL: TelegramEntitlements plist_fragment anchor not found")
             sys.exit(1)
         injection = '        "<key>get-task-allow</key>\\n<false/>\\n",\n'
-        content = anchor_re.sub(m.group(1) + injection, content, count=1)
+        # IMPORTANT: pass replacement via callable, not as a string literal.
+        # re.sub() interprets backslash sequences in replacement strings (so a
+        # literal "\n" in the variable becomes a newline in the substituted
+        # output, breaking Starlark's single-line string syntax). A lambda
+        # bypasses that interpretation — its return value is used verbatim.
+        content = anchor_re.sub(lambda _m: _m.group(1) + injection, content, count=1)
         print("  ✓  Injected get-task-allow=false into TelegramEntitlements")
 
     with open(filepath, "w") as f:
