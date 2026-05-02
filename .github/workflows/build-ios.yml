@@ -175,6 +175,16 @@ jobs:
           echo "build --reuse_sandbox_directories" >> telegram-ios-build/.bazelrc
           echo "startup --host_jvm_args=-Xmx6g" >> telegram-ios-build/.bazelrc
 
+          # Disable rules_apple's automatic get-task-allow=true override.
+          # rules_apple force-adds get-task-allow=true to the binary's signed
+          # entitlements when compiling -c dbg (which Telegram-iOS does), even
+          # though our Ad Hoc Distribution profile says false. iOS rejects the
+          # resulting profile/binary mismatch at OTA install with "TranslateGram
+          # cannot be installed". Setting this define makes rules_apple honor
+          # the entitlements file's value instead of forcing true. (Defined in
+          # rules_apple/apple/internal/entitlements_support.bzl _include_debug_entitlements.)
+          echo "build --define=apple.add_debugger_entitlement=False" >> telegram-ios-build/.bazelrc
+
           # L2: GCS remote cache (shared across all runs)
           GCS_KEY='${{ secrets.GCS_SA_KEY }}'
           if [ -n "$GCS_KEY" ] && [ "$GCS_KEY" != "" ]; then
