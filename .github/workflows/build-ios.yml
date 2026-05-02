@@ -115,11 +115,14 @@ jobs:
           security set-keychain-settings "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 
-          # Decode and import the Apple Distribution certificate
-          # (same P12 the TestFlight workflow uses — required for Ad Hoc OTA install)
-          echo "${{ secrets.DIST_CERTIFICATE_P12 }}" | base64 -d > /tmp/signing.p12
+          # Decode and import the iOS Development certificate
+          # OTA install via itms-services:// requires Development profiles +
+          # Development cert. Apple's distribution-validation server rejects
+          # Ad Hoc Distribution IPAs from unverified accounts; Development
+          # profiles use local-only validation and install reliably.
+          echo "${{ secrets.SIGNING_CERTIFICATE_P12 }}" | base64 -d > /tmp/signing.p12
           security import /tmp/signing.p12 -k "$KEYCHAIN" \
-            -P "${{ secrets.DIST_CERTIFICATE_PASSWORD }}" \
+            -P "${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}" \
             -T /usr/bin/codesign -T /usr/bin/security
           rm -f /tmp/signing.p12
 
@@ -174,16 +177,6 @@ jobs:
           echo "build --experimental_remote_cache_compression" >> telegram-ios-build/.bazelrc
           echo "build --reuse_sandbox_directories" >> telegram-ios-build/.bazelrc
           echo "startup --host_jvm_args=-Xmx6g" >> telegram-ios-build/.bazelrc
-
-          # Disable rules_apple's automatic get-task-allow=true override.
-          # rules_apple force-adds get-task-allow=true to the binary's signed
-          # entitlements when compiling -c dbg (which Telegram-iOS does), even
-          # though our Ad Hoc Distribution profile says false. iOS rejects the
-          # resulting profile/binary mismatch at OTA install with "TranslateGram
-          # cannot be installed". Setting this define makes rules_apple honor
-          # the entitlements file's value instead of forcing true. (Defined in
-          # rules_apple/apple/internal/entitlements_support.bzl _include_debug_entitlements.)
-          echo "build --define=apple.add_debugger_entitlement=False" >> telegram-ios-build/.bazelrc
 
           # L2: GCS remote cache (shared across all runs)
           GCS_KEY='${{ secrets.GCS_SA_KEY }}'
